@@ -1,0 +1,11 @@
+# Bỏ qua môi trường ảo (Rất nặng, vài GB)
+venv/
+__pycache__/
+
+# Bỏ qua dữ liệu thô và các file đặc trưng Tensor (Hơn 11GB)
+research/data/features/
+research/data/images/
+
+# Bỏ qua các file rác của hệ điều hành
+.DS_Store
+Thumbs.db
