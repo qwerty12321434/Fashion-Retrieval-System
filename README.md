@@ -45,7 +45,7 @@ pip install transformers pillow tqdm
 ### Bước 4: Tải Dữ liệu (Features & Data)
 Vì các file đặc trưng (Tensors) rất nặng (khoảng 11GB) nên không được đẩy lên GitHub. Bạn cần tải chúng từ Google Drive.
 
-1. Tải file nén dữ liệu từ link Drive: `<DÁN_LINK_GOOGLE_DRIVE_CỦA_BẠN_VÀO_ĐÂY>`
+1. Tải file nén dữ liệu từ link Drive: [https://drive.google.com/drive/u/0/folders/1p_zyidgXWEOp0k1IaOv1ba8Z9CWVTULi]
 2. Giải nén và đặt các file vào đúng cấu trúc thư mục sau:
    ```text
    FashionSystem/
