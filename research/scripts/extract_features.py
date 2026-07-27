@@ -109,9 +109,9 @@ def main():
     print(f"Using device: {device}")
 
     # Đưa việc khởi tạo Model vào trong main() để tránh lỗi kẹt GPU khi dùng num_workers > 0 trên Windows
-    model_name = "openai/clip-vit-base-patch32"
+    model_name = "openai/clip-vit-base-patch32" # model Vision Transformer (ViT) của OpenAI
     processor = CLIPProcessor.from_pretrained(model_name)
-    model = CLIPModel.from_pretrained(model_name, use_safetensors=True).to(device)
+    model = CLIPModel.from_pretrained(model_name, use_safetensors=True).to(device) 
     model.eval()
 
     # Bật lại cả 2 hàm để extract toàn bộ từ đầu
