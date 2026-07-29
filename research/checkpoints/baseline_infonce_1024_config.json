@@ -1,0 +1,13 @@
+{
+    "run_name": "baseline_infonce_1024",
+    "batch_size": 256,
+    "epochs": 50,
+    "lr": 0.0001,
+    "weight_decay": 0.0001,
+    "temperature": 0.1,
+    "dev_size": 300,
+    "seed": 42,
+    "loss": "infonce",
+    "hidden_dim": 1024,
+    "sampler": "hard_negative"
+}

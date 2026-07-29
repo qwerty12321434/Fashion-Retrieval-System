@@ -1,7 +1,8 @@
 import os
 import json
+import random
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from torch.nn.utils.rnn import pad_sequence
 
 class FashionIQDataset(Dataset):
@@ -26,6 +27,8 @@ class FashionIQDataset(Dataset):
             print(f"Loading metadata from {json_path}...")
             with open(json_path, 'r', encoding='utf-8') as f:
                 cat_data = json.load(f)
+                for item in cat_data:
+                    item['category'] = cat
                 self.data.extend(cat_data)
                 
             # Load Text Features
@@ -103,3 +106,59 @@ def custom_collate_fn(batch):
     mask = torch.arange(max_len).expand(batch_size, max_len) < text_lengths.unsqueeze(1)
     
     return src_imgs_batched, txt_feats_padded, mask, text_lengths, tgt_imgs_batched
+
+class CategoryBatchSampler(Sampler):
+    """
+    Sampler đặc biệt: Đảm bảo mỗi Batch bốc ra chỉ chứa các mẫu thuộc CÙNG MỘT danh mục (Dress / Shirt / TopTee).
+    Giúp InfoNCE loss không bị rơi vào bẫy 'Easy Negatives' (So sánh váy với áo sơ mi).
+    """
+    def __init__(self, dataset, batch_size, drop_last=False):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        
+        # Nhóm các index theo category
+        self.cat_indices = {}
+        
+        # Hỗ trợ cả Dataset gốc lẫn Subset
+        is_subset = hasattr(dataset, 'dataset') and hasattr(dataset, 'indices')
+        base_dataset = dataset.dataset if is_subset else dataset
+        
+        # Nếu là Subset, ta duyệt qua các indices được cấp
+        iterable_indices = range(len(dataset))
+        for idx in iterable_indices:
+            # Lấy index thực tế trong base_dataset
+            real_idx = dataset.indices[idx] if is_subset else idx
+            item = base_dataset.data[real_idx]
+            cat = item.get('category', 'unknown')
+            if cat not in self.cat_indices:
+                self.cat_indices[cat] = []
+            # Ta lưu index tương đối của Subset (từ 0 đến len(Subset)-1) để DataLoader dùng
+            self.cat_indices[cat].append(idx)
+            
+    def __iter__(self):
+        # Tạo danh sách các batch
+        batches = []
+        for cat, indices in self.cat_indices.items():
+            # Xáo trộn index trong nội bộ danh mục
+            random.shuffle(indices)
+            # Cắt thành các batch
+            for i in range(0, len(indices), self.batch_size):
+                batch = indices[i:i+self.batch_size]
+                if len(batch) == self.batch_size or not self.drop_last:
+                    batches.append(batch)
+                    
+        # Xáo trộn thứ tự các batch (để mô hình không học 1 vệt toàn váy rồi mới đến áo)
+        random.shuffle(batches)
+        
+        for batch in batches:
+            yield batch
+            
+    def __len__(self):
+        length = 0
+        for cat, indices in self.cat_indices.items():
+            if self.drop_last:
+                length += len(indices) // self.batch_size
+            else:
+                length += (len(indices) + self.batch_size - 1) // self.batch_size
+        return length

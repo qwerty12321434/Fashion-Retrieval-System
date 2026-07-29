@@ -8,8 +8,9 @@ research/data/features/
 research/data/images/
 research/data/json/
 
-# Bỏ qua các checkpoint mô hình (Trọng số đã huấn luyện)
-research/checkpoints/
+# Bỏ qua các file trọng số mô hình (chỉ giữ lại config.json)
+research/checkpoints/*.pth
+research/demo_result*.png
 
 # Bỏ qua các file rác của hệ điều hành
 .DS_Store

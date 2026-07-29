@@ -41,12 +41,13 @@ Dự án sử dụng các thư viện cốt lõi sau:
 - `torch==2.5.1+cu121`
 - `torchvision==0.20.1+cu121`
 - `transformers==5.14.1`
+- `pytorch-metric-learning`
 - `tqdm`, `pillow`, `matplotlib`
 
 Chạy lệnh sau để cài đặt toàn bộ:
 ```bash
 pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
-pip install transformers pillow tqdm matplotlib
+pip install transformers pytorch-metric-learning pillow tqdm matplotlib
 ```
 
 ### Bước 4: Chuẩn bị Dữ liệu
@@ -72,10 +73,15 @@ pip install transformers pillow tqdm matplotlib
 
 ## 🛠️ Quá trình Thực hiện & Cách chạy Script
 
-Dự án được triển khai qua các giai đoạn rõ ràng. Tất cả các script chạy trong thư mục `research/`.
+Dự án được phân chia thành các thư mục rõ ràng:
+- `data/`: Chứa Dataset Loader và các script tiền xử lý/trích xuất đặc trưng. Sử dụng kỹ thuật `CategoryBatchSampler` (Hard Negative) để ép mô hình học đặc trưng chi tiết.
+- `models/`: Chứa định nghĩa kiến trúc mạng AI (`model.py`) và các hàm mất mát (`loss.py` gồm `InfoNCE` và `TripletLoss`).
+- `checkpoints/`: Nơi lưu trữ tự động các trọng số (`.pth`) và file cấu hình (`_config.json`) của từng thực nghiệm.
+
+Tất cả các script thực thi chính đều nằm trong `research/src/`. Dưới đây là luồng chạy (pipeline) tiêu chuẩn:
 
 ### Giai đoạn 1: Trích xuất Đặc trưng (Feature Extraction)
-Thay vì load ảnh thô (rất nặng và chậm gây quá tải VRAM), chúng tôi sử dụng mô hình pre-trained `CLIP (openai/clip-vit-base-patch32)` để chuyển đổi hình ảnh và văn bản thành các vector (`.pt`). Quá trình này giúp tối ưu hóa RAM tuyệt đối và đẩy nhanh tốc độ huấn luyện.
+Sử dụng mô hình pre-trained `CLIP (openai/clip-vit-base-patch32)` đã đóng băng (freeze encoder) để chuyển đổi hình ảnh và văn bản thành các vector (`.pt`). Quá trình này giúp tối ưu hóa RAM tuyệt đối và đẩy nhanh tốc độ huấn luyện.
 
 - **Cách chạy:**
   ```bash
@@ -83,52 +89,69 @@ Thay vì load ảnh thô (rất nặng và chậm gây quá tải VRAM), chúng 
   python src/data/extract_val.py
   python src/data/prep_gallery.py
   ```
-- **Kết quả:** Các file `.pt` được lưu trong `data/features/`. *(Bạn có thể bỏ qua bước này nếu đã tải dữ liệu sẵn từ Drive).*
 
 ### Giai đoạn 2: Huấn luyện (Training)
 Chúng tôi sử dụng kiến trúc **BaselineFusion**: 
-Nhận `CLS Token` của ảnh gốc (vector đại diện toàn cảnh) và `EOS Token` của văn bản -> Nối lại (Concat) -> Cho qua mạng MLP 2 lớp -> So sánh với `CLS Token` của ảnh đích bằng hàm `InfoNCE Loss` (Contrastive Loss).
+Nhận `CLS Token` của ảnh gốc (vector 768 chiều) và `EOS Token` của văn bản (512 chiều) -> Nối lại (Concat) -> Cho qua mạng MLP 2 lớp (với `hidden_dim=1024`) -> So sánh với `CLS Token` của ảnh đích.
 
-- **Đặc điểm:** Tối ưu hóa bộ nhớ siêu nhẹ. Hệ thống có thể load toàn bộ 18.000 mẫu của cả 3 danh mục (Dress, Shirt, Toptee) vào RAM và huấn luyện 50 Epochs chỉ trong vài phút.
+Đặc biệt, DataLoader sử dụng **Hard Negative Sampling** (đảm bảo 1 batch chứa toàn các mẫu cùng loại) để tăng độ khó, kết hợp với hàm **InfoNCE Loss** để tối ưu.
+
 - **Cách chạy:**
+  Script hỗ trợ các tham số dòng lệnh (`argparse`) để dễ dàng quản lý thực nghiệm và chọn hàm loss (`infonce` hoặc `triplet`):
   ```bash
   cd research
-  python src/train.py
+  python src/train.py --run_name baseline_infonce_1024 --loss infonce --epochs 50
   ```
-- **Kết quả tạm thời:** Loss InfoNCE hội tụ rất tốt, Best Dev Accuracy đạt `38.67%` sau 50 Epochs. Trọng số mô hình được lưu tự động tại `research/checkpoints/baseline_all_best.pth`.
+- **Kết quả:** Hệ thống tự động tạo file `checkpoints/baseline_infonce_1024_config.json` và lưu trọng số tốt nhất tại `checkpoints/baseline_infonce_1024_best.pth`.
 
 ### Giai đoạn 3: Đánh giá (Evaluation)
-Đo lường độ chính xác trên tập Validation của Fashion-IQ bằng chỉ số Recall@10 và Recall@50. Script sẽ tự động đánh giá và so sánh mô hình **CLIP Zero-Shot (Cộng Vector tĩnh)** và mô hình học sâu **BaselineFusion**.
+Đo lường độ chính xác trên tập Validation của toàn bộ 3 danh mục bằng chỉ số Recall@10 và Recall@50. Script hỗ trợ **đánh giá nhiều mô hình cùng lúc** (`nargs='+'`).
 
 - **Cách chạy:**
   ```bash
   cd research
-  python src/evaluate.py
+  python src/evaluate.py --ckpt baseline_infonce_1024_best.pth baseline_triplet_1024_best.pth
   ```
-- **Kết quả ghi nhận trên toàn bộ danh mục:**
-  ```text
-  1. CLIP ZERO-SHOT (Vector Addition)
-   - Recall@10: 5.85%
-   - Recall@50: 12.89%
 
-  2. BASELINE FUSION (Train on ALL Categories)
-   - Recall@10: 8.08%
-   - Recall@50: 17.70%
+- **Kết quả ghi nhận:**
+  ```text
+  === KẾT QUẢ TỔNG HỢP ===
+  Tổng số truy vấn hợp lệ: 6016/6016
+
+  1. CLIP ZERO-SHOT (Vector Addition)
+   - Recall@10: 5.82%
+   - Recall@50: 13.61%
+
+  2. BASELINE FUSION (baseline_infonce_1024)
+   - Recall@10: 6.78%
+   - Recall@50: 17.07%
+
+  3. BASELINE FUSION (baseline_triplet_1024)
+   - Recall@10: 6.52%
+   - Recall@50: 16.37%
   ```
-  *(Mô hình BaselineFusion chứng minh sự vượt trội khi có thể hiểu được ngữ cảnh ngôn ngữ phức tạp để chỉnh sửa ảnh).*
 
 ### Giai đoạn 4: Trực quan hóa (Demo)
-Script cho phép nhập 1 ASIN ảnh gốc (Candidate) và 1 câu lệnh modifier để tìm ra top 5 kết quả tốt nhất. Nó sẽ vẽ biểu đồ so sánh trực quan giữa Zero-Shot và BaselineFusion.
+Script cho phép nhập 1 ASIN ảnh gốc (Candidate) và 1 câu lệnh modifier để tìm ra top 5 kết quả tốt nhất. Nó sẽ vẽ biểu đồ so sánh trực quan giữa Zero-Shot và mô hình đã train (tự động phát hiện kích thước kiến trúc từ file weights).
 
 - **Cách chạy:**
   ```bash
   cd research
-  python src/demo.py --candidate "B00FHFMMMW" --text "is softly colored,has no shoulder straps and looser skirt" --output "demo_result_v5.png"
+  python src/demo.py --candidate "B00FHFMMMW" --text "is softly colored,has no shoulder straps and looser skirt" --ckpt baseline_infonce_1024_best.pth --output "demo_result.png"
   ```
 - **Kết quả:**
-  ![Demo Result](research/demo_result_v5.png)
+  ![Demo Result](demo_result.png)
 
 ---
 
-## 🎯 Kết luận
-- Dự án áp dụng phương châm "Less is More". Bằng cách loại bỏ kiến trúc Attention đa mảng phức tạp (nguyên nhân gây Overfit) và sử dụng Global CLS Token kết hợp MLP đơn giản, chúng tôi đã xây dựng thành công một hệ thống **Nhẹ, Nhanh và Khái quát tốt** cho bài toán Composed Image Retrieval đa danh mục thời trang.
+## 🎯 Kết luận và Hướng Phát Triển
+Dự án đã trải qua nhiều pha tối ưu hóa:
+1. Nâng cấp bộ nhớ mạng (MLP `hidden_dim` từ 512 lên 1024).
+2. Chuyển đổi chiến lược học từ ngẫu nhiên (Random Sampling) sang thử thách (Hard Negative Sampling).
+3. Chứng minh hàm đối chiếu InfoNCE hiệu quả hơn Triplet Loss với batch_size lớn.
+
+**Tuy nhiên, các kết quả hiện tại chỉ ra một Nút Thắt Cổ Chai (Bottleneck) về kiến trúc:** 
+Mạng `BaselineFusion` hiện tại chỉ nối trực tiếp vector tổng quát (Global CLS Token) của ảnh và chữ. Cách nén thông tin thô bạo này làm mất đi toàn bộ chi tiết không gian (spatial details) của bức ảnh (như vị trí cổ áo, họa tiết logo). Việc tăng tham số mạng hay làm khó bộ nạp dữ liệu không thể vượt qua ngưỡng giới hạn này.
+
+**Hướng đi tiếp theo (Giai đoạn 2):** 
+Dự án sẽ chuyển sang phát triển cấu trúc **Attention Fusion**. Thay vì dùng CLS Token, chúng tôi sẽ nạp 49 Patch Tokens của bức ảnh, dùng câu chữ (Text EOS) để làm Query chiếu (Attend) vào từng mảnh ghép của ảnh. Từ đó giúp mô hình thực sự "hiểu" được câu chữ đang nhắm tới thay đổi phần nào trên bức ảnh!

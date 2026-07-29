@@ -1,6 +1,7 @@
 import os
 import sys
 import io
+import time
 import argparse
 import json
 import torch
@@ -19,10 +20,16 @@ def main():
     parser.add_argument("--candidate", type=str, required=True, help="ASIN của ảnh gốc")
     parser.add_argument("--text", type=str, required=True, help="Câu lệnh thay đổi (modifier)")
     parser.add_argument("--output", type=str, default="demo_result.png", help="Đường dẫn lưu ảnh kết quả")
+    parser.add_argument("--ckpt", type=str, default="baseline_all_best.pth", help="Checkpoint to load")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Sử dụng thiết bị: {device}")
+    
+    ckpt_path = os.path.abspath(f"checkpoints/{args.ckpt}")
+    mtime = os.path.getmtime(ckpt_path) if os.path.exists(ckpt_path) else 0
+    print(f"\n[INFO] Loading checkpoint from: {ckpt_path}")
+    print(f"[INFO] Checkpoint modified time: {time.ctime(mtime)}\n")
 
     # 1. Khởi tạo mô hình
     print("1. Nạp CLIP và BaselineFusion...")
@@ -31,8 +38,10 @@ def main():
     clip_model = CLIPModel.from_pretrained(model_name, use_safetensors=True).to(device)
     clip_model.eval()
 
-    fusion_model = BaselineFusion(hidden_dim=512).to(device)
-    fusion_model.load_state_dict(torch.load("checkpoints/baseline_all_best.pth", map_location=device, weights_only=True))
+    state_dict = torch.load(f"checkpoints/{args.ckpt}", map_location=device, weights_only=True)
+    detected_hidden_dim = state_dict['mlp.0.weight'].shape[0] if 'mlp.0.weight' in state_dict else 1024
+    fusion_model = BaselineFusion(hidden_dim=detected_hidden_dim).to(device)
+    fusion_model.load_state_dict(state_dict)
     fusion_model.eval()
 
     # 2. Nạp Gallery
