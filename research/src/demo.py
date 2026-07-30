@@ -6,9 +6,8 @@ import argparse
 import json
 import torch
 import torch.nn.functional as F
-from PIL import Image
-import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
+from PIL import Image, ImageDraw, ImageFont
+import textwrap
 from transformers import CLIPProcessor, CLIPModel
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
@@ -21,6 +20,8 @@ def main():
     parser.add_argument("--text", type=str, required=True, help="Câu lệnh thay đổi (modifier)")
     parser.add_argument("--output", type=str, default="demo_result.png", help="Đường dẫn lưu ảnh kết quả")
     parser.add_argument("--ckpt", type=str, default="baseline_all_best.pth", help="Checkpoint to load")
+    parser.add_argument("--backbone", type=str, default="openai/clip-vit-base-patch32", help="Mô hình backbone sử dụng")
+    parser.add_argument("--features_dir", type=str, default="data/features", help="Thư mục chứa feature của kho ảnh")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -32,8 +33,8 @@ def main():
     print(f"[INFO] Checkpoint modified time: {time.ctime(mtime)}\n")
 
     # 1. Khởi tạo mô hình
-    print("1. Nạp CLIP và BaselineFusion...")
-    model_name = "openai/clip-vit-base-patch32"
+    print(f"1. Nạp CLIP ({args.backbone}) và BaselineFusion...")
+    model_name = args.backbone
     processor = CLIPProcessor.from_pretrained(model_name)
     clip_model = CLIPModel.from_pretrained(model_name, use_safetensors=True).to(device)
     clip_model.eval()
@@ -45,8 +46,8 @@ def main():
     fusion_model.eval()
 
     # 2. Nạp Gallery
-    print("2. Nạp kho ảnh Gallery...")
-    features_dir = "data/features"
+    print(f"2. Nạp kho ảnh Gallery từ {args.features_dir}...")
+    features_dir = args.features_dir
     gallery_cls_768 = torch.load(os.path.join(features_dir, "gallery_cls_768.pt"), map_location=device)
     gallery_embeds_512 = torch.load(os.path.join(features_dir, "gallery_embeds_512.pt"), map_location=device)
     with open(os.path.join(features_dir, "gallery_asins.json"), "r") as f:
@@ -92,7 +93,10 @@ def main():
 
     # 6. Xử lý BaselineFusion
     print("6. Xử lý BaselineFusion...")
-    t_eos = txt_hidden[:, -1, :] # Lấy EOS token của text
+    t_eos = txt_hidden[
+        torch.arange(txt_hidden.shape[0], device=device),
+        txt_inputs.input_ids.to(torch.int).argmax(dim=-1)
+    ] # Lấy EOS token của text bằng vị trí có ID cao nhất (EOS)
     
     with torch.no_grad():
         bf_query = fusion_model(candidate_cls, t_eos) # [1, 768]
@@ -102,56 +106,67 @@ def main():
     bf_sims = (bf_query_norm @ gallery_cls_norm.T).squeeze(0)
     bf_scores, bf_top5_idx = torch.topk(bf_sims, k=5)
     bf_asins = [gallery_asins[idx] for idx in bf_top5_idx]
-    
-    # 7. Vẽ biểu đồ trực quan (2 Rows)
+    # 7. Vẽ biểu đồ trực quan bằng Pillow (Thay cho matplotlib để tránh lỗi DLL Policy)
     print("7. Tạo ảnh trực quan...")
-    fig = plt.figure(figsize=(24, 10))
-    gs = GridSpec(2, 6, figure=fig)
     
-    # Cột bên trái: Ảnh Candidate + Text
-    ax_query = fig.add_subplot(gs[0:2, 0])
-    ax_query.imshow(image)
-    ax_query.set_title(f"QUERY\nASIN: {args.candidate}\n\n+ TEXT:\n'{args.text}'", fontsize=14, loc='center', color='blue')
-    ax_query.axis("off")
+    CELL_W, CELL_H, TEXT_H, PADDING = 300, 400, 80, 20
+    TOTAL_W = CELL_W * 6
+    TOTAL_H = (CELL_H + TEXT_H) * 2
     
-    # Hàng 1: ZERO-SHOT CLIP
-    for i, asin in enumerate(zs_asins):
-        ax = fig.add_subplot(gs[0, i+1])
-        res_path = os.path.join(image_dir, f"{asin}.jpg")
-        if not os.path.exists(res_path):
-            res_path = os.path.join(image_dir, f"{asin}.png")
-        try:
-            res_img = Image.open(res_path).convert("RGB")
-            ax.imshow(res_img)
-            score = zs_scores[i].item()
-            prefix = "[CLIP ZERO-SHOT]\n" if i == 0 else ""
-            title_color = "red" if i == 0 else "black"
-            ax.set_title(f"{prefix}Top {i+1} ASIN: {asin}\nScore: {score:.3f}", color=title_color, fontsize=12)
-            ax.axis("off")
-        except Exception:
-            ax.set_title(f"Image Missing\n{asin}")
-            ax.axis("off")
-
-    # Hàng 2: BASELINE FUSION
-    for i, asin in enumerate(bf_asins):
-        ax = fig.add_subplot(gs[1, i+1])
-        res_path = os.path.join(image_dir, f"{asin}.jpg")
-        if not os.path.exists(res_path):
-            res_path = os.path.join(image_dir, f"{asin}.png")
-        try:
-            res_img = Image.open(res_path).convert("RGB")
-            ax.imshow(res_img)
-            score = bf_scores[i].item()
-            prefix = "[BASELINE FUSION]\n" if i == 0 else ""
-            title_color = "green" if i == 0 else "black"
-            ax.set_title(f"{prefix}Top {i+1} ASIN: {asin}\nScore: {score:.3f}", color=title_color, fontsize=12)
-            ax.axis("off")
-        except Exception:
-            ax.set_title(f"Image Missing\n{asin}")
-            ax.axis("off")
+    canvas = Image.new("RGB", (TOTAL_W, TOTAL_H), "white")
+    draw = ImageDraw.Draw(canvas)
+    
+    try:
+        # Thử load font Arial trên Windows
+        font = ImageFont.truetype("arial.ttf", 16)
+        font_bold = ImageFont.truetype("arialbd.ttf", 18)
+    except IOError:
+        font = font_bold = ImageFont.load_default()
+        
+    def draw_cell(x, y, img_path, title_lines, title_color="black"):
+        # Vẽ ảnh
+        if os.path.exists(img_path):
+            try:
+                img = Image.open(img_path).convert("RGB")
+                img.thumbnail((CELL_W - 2*PADDING, CELL_H - 2*PADDING))
+                img_x = x + (CELL_W - img.width) // 2
+                img_y = y + TEXT_H + (CELL_H - img.height) // 2
+                canvas.paste(img, (img_x, img_y))
+            except Exception:
+                draw.text((x + PADDING, y + TEXT_H + PADDING), "Image Load Error", fill="red", font=font_bold)
+        else:
+            draw.text((x + PADDING, y + TEXT_H + PADDING), f"Image Missing\n{os.path.basename(img_path)}", fill="red", font=font_bold)
             
-    plt.tight_layout()
-    plt.savefig(args.output, bbox_inches='tight')
+        # Vẽ chữ
+        text_y = y + 10
+        for line in title_lines:
+            f = font_bold if "ZERO-SHOT" in line or "FUSION" in line or "QUERY" in line else font
+            draw.text((x + PADDING, text_y), line, fill=title_color, font=f)
+            text_y += 22
+            
+    # Cột 0: Query
+    q_x = 0
+    q_y = (TOTAL_H - (CELL_H + TEXT_H)) // 2  # Căn giữa theo chiều dọc
+    query_lines = ["QUERY", f"ASIN: {args.candidate}", "", "TEXT:"] + textwrap.wrap(f"'{args.text}'", width=25)
+    draw_cell(q_x, q_y, candidate_path, query_lines, "blue")
+    
+    # Hàng 0: Zero-shot
+    for i, (asin, score) in enumerate(zip(zs_asins, zs_scores)):
+        img_path = os.path.join(image_dir, f"{asin}.jpg")
+        if not os.path.exists(img_path): img_path = os.path.join(image_dir, f"{asin}.png")
+        lines = ["[CLIP ZERO-SHOT]"] if i == 0 else []
+        lines.extend([f"Top {i+1} ASIN: {asin}", f"Score: {score.item():.3f}"])
+        draw_cell((i + 1) * CELL_W, 0, img_path, lines, "red" if i == 0 else "black")
+        
+    # Hàng 1: BaselineFusion
+    for i, (asin, score) in enumerate(zip(bf_asins, bf_scores)):
+        img_path = os.path.join(image_dir, f"{asin}.jpg")
+        if not os.path.exists(img_path): img_path = os.path.join(image_dir, f"{asin}.png")
+        lines = ["[BASELINE FUSION]"] if i == 0 else []
+        lines.extend([f"Top {i+1} ASIN: {asin}", f"Score: {score.item():.3f}"])
+        draw_cell((i + 1) * CELL_W, CELL_H + TEXT_H, img_path, lines, "green" if i == 0 else "black")
+        
+    canvas.save(args.output)
     print(f"\n=> Đã lưu kết quả tại: {args.output}")
 
 if __name__ == "__main__":

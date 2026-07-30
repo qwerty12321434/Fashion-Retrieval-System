@@ -3,14 +3,19 @@ venv/
 __pycache__/
 *.pyc
 
-# Bỏ qua dữ liệu thô và các file đặc trưng Tensor (Hơn 11GB)
+# Bỏ qua dữ liệu thô và các file đặc trưng Tensor (Hàng chục GB)
 research/data/features/
+research/data/features_fashionclip/
 research/data/images/
 research/data/json/
 
 # Bỏ qua các file trọng số mô hình (chỉ giữ lại config.json)
 research/checkpoints/*.pth
+
+# Bỏ qua ảnh kết quả demo (sinh ra khi chạy demo.py)
 research/demo_result*.png
+research/demo_fashionclip*.png
+*.png
 
 # Bỏ qua các file rác của hệ điều hành
 .DS_Store

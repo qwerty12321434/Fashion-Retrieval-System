@@ -1,157 +1,199 @@
 # Fashion-IQ Composed Image Retrieval
 
-Dự án này là mã nguồn thực nghiệm cho bài toán **Composed Image Retrieval (Truy xuất ảnh kết hợp)** trên bộ dữ liệu Fashion-IQ. 
-Mục tiêu là kết hợp ảnh gốc và câu lệnh ngôn ngữ tự nhiên để tìm ra bức ảnh đích mong muốn.
+Dự án mã nguồn thực nghiệm cho bài toán **Composed Image Retrieval (Truy xuất Ảnh Kết hợp)** trên bộ dữ liệu Fashion-IQ.
+Mục tiêu: kết hợp *ảnh gốc* và *câu lệnh ngôn ngữ tự nhiên* để tìm ra bức ảnh đích mong muốn từ kho ảnh 74,381 sản phẩm thời trang.
 
-- **GitHub Repository**: [https://github.com/qwerty12321434/Fashion-Retrieval-System.git](https://github.com/qwerty12321434/Fashion-Retrieval-System.git)
-- **Google Drive Dữ liệu (Features)**: [https://drive.google.com/drive/u/0/folders/1p_zyidgXWEOp0k1IaOv1ba8Z9CWVTULi](https://drive.google.com/drive/u/0/folders/1p_zyidgXWEOp0k1IaOv1ba8Z9CWVTULi)
-
-## 📌 Bộ Dữ Liệu Fashion-IQ
-Fashion-IQ là một bộ dữ liệu chuẩn mực cho việc tìm kiếm ảnh thời trang dựa trên ngôn ngữ tự nhiên. 
-Nó chứa 3 danh mục chính:
-- **Dress (Váy)**
-- **Shirt (Áo sơ mi)**
-- **Top & Tee (Áo thun)**
-
-Mỗi truy vấn (query) trong bộ dữ liệu bao gồm: một **ảnh gốc (candidate image)** và hai **câu lệnh chỉnh sửa (modifiers)** mô tả sự khác biệt về mặt thiết kế/màu sắc giữa ảnh gốc và **ảnh mục tiêu (target image)**. 
+- **GitHub**: [qwerty12321434/Fashion-Retrieval-System](https://github.com/qwerty12321434/Fashion-Retrieval-System.git)
+- **Google Drive (Features)**: [Link Drive](https://drive.google.com/drive/u/0/folders/1p_zyidgXWEOp0k1IaOv1ba8Z9CWVTULi)
 
 ---
 
-## 🚀 Hướng dẫn Cài đặt Môi trường
+## 📊 Kết Quả Thực Nghiệm (FashionIQ Validation — 6016 queries)
 
-Hệ thống được thiết kế chạy tối ưu nhất với GPU NVIDIA (CUDA).
+### Backbone: CLIP-base (`openai/clip-vit-base-patch32`)
+| Mô hình | Recall@10 | Recall@50 | Checkpoint |
+|---------|-----------|-----------|-----------|
+| Zero-shot Vector Addition | 5.82% | 13.61% | — |
+| BaselineFusion + InfoNCE | 6.78% | 17.07% | `baseline_infonce_1024_best.pth` |
+| BaselineFusion + Triplet | 6.52% | 16.37% | `baseline_triplet_1024_best.pth` |
 
-### Bước 1: Clone mã nguồn
+### Backbone: FashionCLIP (`patrickjohncyh/fashion-clip`) ⭐ Best
+| Mô hình | Recall@10 | Recall@50 | Checkpoint |
+|---------|-----------|-----------|-----------|
+| Zero-shot Vector Addition | 10.32% | 22.39% | — |
+| BaselineFusion + InfoNCE | 9.18% | 21.13% | `fashionclip_infonce_1024_best.pth` |
+| **BaselineFusion + Triplet** | **12.88%** | **26.56%** | `fashionclip_triplet_1024_best.pth` |
+
+> **Key Insight:** FashionCLIP (fine-tuned trên ~70K sản phẩm thời trang) kết hợp Triplet Loss đạt hiệu năng tốt nhất. FashionCLIP tạo ra không gian embedding đã có cấu trúc tốt cho domain thời trang, nên Triplet Loss (với margin) bảo toàn cấu trúc đó tốt hơn InfoNCE vốn đẩy mạnh toàn bộ negatives ra xa.
+
+---
+
+## 📂 Cấu Trúc Project
+
+```
+FashionSystem/
+└── research/
+    ├── src/
+    │   ├── train.py                        # Script huấn luyện
+    │   ├── evaluate.py                     # Script đánh giá Recall@10/50
+    │   ├── demo.py                         # Script demo trực quan
+    │   ├── data/
+    │   │   └── dataset.py                  # FashionIQDataset, CategoryBatchSampler
+    │   └── models/
+    │       ├── model.py                    # BaselineFusion, AdditiveAttention
+    │       └── loss.py                     # CIRLoss (InfoNCE), CIRTripletLoss
+    ├── scripts/
+    │   ├── extract_features.py             # Trích xuất feature bằng CLIP-base
+    │   └── extract_features_fashionclip.py # Trích xuất feature bằng FashionCLIP ⭐
+    ├── data/
+    │   ├── json/                           # FashionIQ annotation files
+    │   ├── features/                       # Features từ CLIP-base
+    │   │   ├── gallery_cls_768.pt          # [74381, 768] CLS image features
+    │   │   ├── gallery_embeds_512.pt       # [74381, 512] Projected embeddings
+    │   │   ├── gallery_asins.json
+    │   │   ├── {dress|shirt|toptee}_text_tokens.pt
+    │   │   ├── {cat}_val_text_hidden.pt
+    │   │   └── {cat}_val_text_embeds.pt
+    │   └── features_fashionclip/           # Features từ FashionCLIP (cùng cấu trúc)
+    ├── checkpoints/                        # Checkpoint .pth + config .json
+    └── requirements.txt
+```
+
+---
+
+## 🧠 Kiến Trúc Mô Hình
+
+### Backbone
+| Tên | Model ID | Ghi chú |
+|-----|----------|---------|
+| CLIP-base | `openai/clip-vit-base-patch32` | Tổng quát, dùng làm baseline |
+| **FashionCLIP** | `patrickjohncyh/fashion-clip` | Fine-tuned thời trang, **khuyên dùng** |
+
+Cả hai đều dùng kiến trúc **ViT-B/32**: image token `[50, 768]`, text hidden `[seq_len, 512]`, projected embed `[512]`.
+
+### Pipeline
+```
+Candidate Image ──[Backbone Encoder]──> CLS [768]  ─┐
+                                                      ├─> BaselineFusion (MLP) ──> Query [768]
+Text Modifier   ──[Backbone Encoder]──> EOS [512]  ─┘
+
+Query [768]  ──[Cosine Similarity]──> Gallery [74381, 768] ──> Top-K Results
+```
+
+### Loss Functions
+| Loss | Class | Mô tả |
+|------|-------|-------|
+| InfoNCE | `CIRLoss` | Phạt tất cả negatives trong batch — hiệu quả khi không gian embedding hỗn loạn |
+| Triplet | `CIRTripletLoss` | Chỉ phạt negative quá gần positive — tốt hơn khi không gian đã có cấu trúc (FashionCLIP) |
+
+---
+
+## 🚀 Hướng Dẫn Cài Đặt & Chạy
+
+### 0. Yêu Cầu Hệ Thống
+- GPU NVIDIA với CUDA 12.1+
+- RAM ≥ 16GB (gallery features chiếm ~1.1GB VRAM + ~11GB RAM khi train patch tokens)
+
+### 1. Cài Đặt Môi Trường
+
 ```bash
 git clone https://github.com/qwerty12321434/Fashion-Retrieval-System.git
 cd FashionSystem
-```
 
-### Bước 2: Thiết lập Môi trường Ảo
-```bash
 python -m venv venv
-# Kích hoạt trên Windows:
+# Windows:
 .\venv\Scripts\Activate.ps1
-# Kích hoạt trên Linux/MacOS:
+# Linux/macOS:
 source venv/bin/activate
-```
 
-### Bước 3: Cài đặt Thư viện
-Dự án sử dụng các thư viện cốt lõi sau:
-- `torch==2.5.1+cu121`
-- `torchvision==0.20.1+cu121`
-- `transformers==5.14.1`
-- `pytorch-metric-learning`
-- `tqdm`, `pillow`, `matplotlib`
-
-Chạy lệnh sau để cài đặt toàn bộ:
-```bash
 pip install torch==2.5.1+cu121 torchvision==0.20.1+cu121 --extra-index-url https://download.pytorch.org/whl/cu121
 pip install transformers pytorch-metric-learning pillow tqdm matplotlib
 ```
 
-### Bước 4: Chuẩn bị Dữ liệu
-1. Tải toàn bộ thư mục `features/` và `json/` từ Google Drive ở trên.
-2. Đặt vào đúng cấu trúc sau:
-   ```text
-   FashionSystem/
-   ├── research/
-   │   ├── data/
-   │   │   ├── features/
-   │   │   │   ├── gallery_cls_768.pt      # Đặc trưng của 74k ảnh (1.1GB)
-   │   │   │   ├── gallery_embeds_512.pt   # (Cho Baseline CLIP Zero-shot)
-   │   │   │   ├── dress_text_tokens.pt    # Đặc trưng văn bản
-   │   │   │   ├── shirt_text_tokens.pt
-   │   │   │   └── toptee_text_tokens.pt
-   │   │   ├── json/
-   │   │   │   ├── cap.dress.train.json
-   │   │   │   ├── cap.shirt.train.json
-   │   │   │   └── cap.toptee.train.json
-   ```
+### 2. Chuẩn Bị Dữ Liệu
+
+**Tải features từ Google Drive** (nếu không muốn extract lại) → đặt vào `research/data/features/`.
+
+**Hoặc tự extract** (yêu cầu thư mục ảnh FashionIQ):
+
+```bash
+cd research
+
+# CLIP-base features (pipeline cũ)
+python scripts/extract_features.py
+
+# FashionCLIP features (lần đầu download ~600MB, khuyên dùng)
+python scripts/extract_features_fashionclip.py
+# Output: data/features_fashionclip/
+```
+
+### 3. Huấn Luyện
+
+```bash
+cd research
+
+# === CLIP-base ===
+python src/train.py --run_name baseline_infonce_1024 --loss infonce --epochs 50
+python src/train.py --run_name baseline_triplet_1024 --loss triplet --epochs 50
+
+# === FashionCLIP (khuyên dùng) ===
+python src/train.py --run_name fashionclip_infonce_1024 --loss infonce --features_dir data/features_fashionclip
+python src/train.py --run_name fashionclip_triplet_1024 --loss triplet  --features_dir data/features_fashionclip
+```
+
+Checkpoint tốt nhất tự động lưu tại `checkpoints/{run_name}_best.pth`.
+
+### 4. Đánh Giá
+
+```bash
+cd research
+
+# So sánh nhiều checkpoint cùng lúc (cùng features_dir)
+python src/evaluate.py \
+  --ckpt fashionclip_infonce_1024_best.pth fashionclip_triplet_1024_best.pth \
+  --features_dir data/features_fashionclip
+```
+
+### 5. Demo Trực Quan
+
+```bash
+cd research
+
+# Demo với CLIP-base
+python src/demo.py \
+  --candidate "B00FHFMMMW" \
+  --text "is softly colored, has no shoulder straps and looser skirt" \
+  --ckpt baseline_infonce_1024_best.pth \
+  --output demo_result.png
+
+# Demo với FashionCLIP (backbone và features_dir phải đồng bộ với checkpoint!)
+python src/demo.py \
+  --candidate "B00FHFMMMW" \
+  --text "is softly colored, has no shoulder straps and looser skirt" \
+  --ckpt fashionclip_triplet_1024_best.pth \
+  --backbone patrickjohncyh/fashion-clip \
+  --features_dir data/features_fashionclip \
+  --output demo_fashionclip.png
+```
 
 ---
 
-## 🛠️ Quá trình Thực hiện & Cách chạy Script
+## ⚠️ Lưu Ý Quan Trọng
 
-Dự án được phân chia thành các thư mục rõ ràng:
-- `data/`: Chứa Dataset Loader và các script tiền xử lý/trích xuất đặc trưng. Sử dụng kỹ thuật `CategoryBatchSampler` (Hard Negative) để ép mô hình học đặc trưng chi tiết.
-- `models/`: Chứa định nghĩa kiến trúc mạng AI (`model.py`) và các hàm mất mát (`loss.py` gồm `InfoNCE` và `TripletLoss`).
-- `checkpoints/`: Nơi lưu trữ tự động các trọng số (`.pth`) và file cấu hình (`_config.json`) của từng thực nghiệm.
-
-Tất cả các script thực thi chính đều nằm trong `research/src/`. Dưới đây là luồng chạy (pipeline) tiêu chuẩn:
-
-### Giai đoạn 1: Trích xuất Đặc trưng (Feature Extraction)
-Sử dụng mô hình pre-trained `CLIP (openai/clip-vit-base-patch32)` đã đóng băng (freeze encoder) để chuyển đổi hình ảnh và văn bản thành các vector (`.pt`). Quá trình này giúp tối ưu hóa RAM tuyệt đối và đẩy nhanh tốc độ huấn luyện.
-
-- **Cách chạy:**
-  ```bash
-  cd research
-  python src/data/extract_val.py
-  python src/data/prep_gallery.py
-  ```
-
-### Giai đoạn 2: Huấn luyện (Training)
-Chúng tôi sử dụng kiến trúc **BaselineFusion**: 
-Nhận `CLS Token` của ảnh gốc (vector 768 chiều) và `EOS Token` của văn bản (512 chiều) -> Nối lại (Concat) -> Cho qua mạng MLP 2 lớp (với `hidden_dim=1024`) -> So sánh với `CLS Token` của ảnh đích.
-
-Đặc biệt, DataLoader sử dụng **Hard Negative Sampling** (đảm bảo 1 batch chứa toàn các mẫu cùng loại) để tăng độ khó, kết hợp với hàm **InfoNCE Loss** để tối ưu.
-
-- **Cách chạy:**
-  Script hỗ trợ các tham số dòng lệnh (`argparse`) để dễ dàng quản lý thực nghiệm và chọn hàm loss (`infonce` hoặc `triplet`):
-  ```bash
-  cd research
-  python src/train.py --run_name baseline_infonce_1024 --loss infonce --epochs 50
-  ```
-- **Kết quả:** Hệ thống tự động tạo file `checkpoints/baseline_infonce_1024_config.json` và lưu trọng số tốt nhất tại `checkpoints/baseline_infonce_1024_best.pth`.
-
-### Giai đoạn 3: Đánh giá (Evaluation)
-Đo lường độ chính xác trên tập Validation của toàn bộ 3 danh mục bằng chỉ số Recall@10 và Recall@50. Script hỗ trợ **đánh giá nhiều mô hình cùng lúc** (`nargs='+'`).
-
-- **Cách chạy:**
-  ```bash
-  cd research
-  python src/evaluate.py --ckpt baseline_infonce_1024_best.pth baseline_triplet_1024_best.pth
-  ```
-
-- **Kết quả ghi nhận:**
-  ```text
-  === KẾT QUẢ TỔNG HỢP ===
-  Tổng số truy vấn hợp lệ: 6016/6016
-
-  1. CLIP ZERO-SHOT (Vector Addition)
-   - Recall@10: 5.82%
-   - Recall@50: 13.61%
-
-  2. BASELINE FUSION (baseline_infonce_1024)
-   - Recall@10: 6.78%
-   - Recall@50: 17.07%
-
-  3. BASELINE FUSION (baseline_triplet_1024)
-   - Recall@10: 6.52%
-   - Recall@50: 16.37%
-  ```
-
-### Giai đoạn 4: Trực quan hóa (Demo)
-Script cho phép nhập 1 ASIN ảnh gốc (Candidate) và 1 câu lệnh modifier để tìm ra top 5 kết quả tốt nhất. Nó sẽ vẽ biểu đồ so sánh trực quan giữa Zero-Shot và mô hình đã train (tự động phát hiện kích thước kiến trúc từ file weights).
-
-- **Cách chạy:**
-  ```bash
-  cd research
-  python src/demo.py --candidate "B00FHFMMMW" --text "is softly colored,has no shoulder straps and looser skirt" --ckpt baseline_infonce_1024_best.pth --output "demo_result.png"
-  ```
-- **Kết quả:**
-  ![Demo Result](demo_result.png)
+| Vấn đề | Giải thích |
+|--------|-----------|
+| **Đồng bộ backbone & features_dir** | Checkpoint được train với backbone nào thì phải dùng `--features_dir` tương ứng. Sai sẽ cho kết quả vô nghĩa nhưng không crash. |
+| **Chạy từ `research/`** | Tất cả lệnh chạy từ `FashionSystem/research/` để đường dẫn tương đối (`data/`, `checkpoints/`, `src/`) hoạt động đúng. |
+| **Windows + DataLoader** | Script có `if __name__ == "__main__":` guard để tránh deadlock với `num_workers > 0` trên Windows. |
 
 ---
 
-## 🎯 Kết luận và Hướng Phát Triển
-Dự án đã trải qua nhiều pha tối ưu hóa:
-1. Nâng cấp bộ nhớ mạng (MLP `hidden_dim` từ 512 lên 1024).
-2. Chuyển đổi chiến lược học từ ngẫu nhiên (Random Sampling) sang thử thách (Hard Negative Sampling).
-3. Chứng minh hàm đối chiếu InfoNCE hiệu quả hơn Triplet Loss với batch_size lớn.
+## 📈 Lộ Trình Phát Triển
 
-**Tuy nhiên, các kết quả hiện tại chỉ ra một Nút Thắt Cổ Chai (Bottleneck) về kiến trúc:** 
-Mạng `BaselineFusion` hiện tại chỉ nối trực tiếp vector tổng quát (Global CLS Token) của ảnh và chữ. Cách nén thông tin thô bạo này làm mất đi toàn bộ chi tiết không gian (spatial details) của bức ảnh (như vị trí cổ áo, họa tiết logo). Việc tăng tham số mạng hay làm khó bộ nạp dữ liệu không thể vượt qua ngưỡng giới hạn này.
-
-**Hướng đi tiếp theo (Giai đoạn 2):** 
-Dự án sẽ chuyển sang phát triển cấu trúc **Attention Fusion**. Thay vì dùng CLS Token, chúng tôi sẽ nạp 49 Patch Tokens của bức ảnh, dùng câu chữ (Text EOS) để làm Query chiếu (Attend) vào từng mảnh ghép của ảnh. Từ đó giúp mô hình thực sự "hiểu" được câu chữ đang nhắm tới thay đổi phần nào trên bức ảnh!
+| Mức | Tính năng | Trạng thái |
+|-----|-----------|-----------|
+| 0 | Fix tên checkpoint động (`--run_name`) | ✅ Hoàn thành |
+| 1 | Triplet Loss + arg `--loss` | ✅ Hoàn thành |
+| 2 | AttentionFusion (50 patch tokens) | 🔄 Đang lên kế hoạch |
+| 3 | Attribute Classifier + Rerank | ⬜ Chưa bắt đầu |
+| 4 | FashionCLIP backbone (`--backbone`, `--features_dir`) | ✅ Hoàn thành |

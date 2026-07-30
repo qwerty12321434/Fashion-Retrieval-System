@@ -6,12 +6,13 @@ from torch.utils.data import Dataset, Sampler
 from torch.nn.utils.rnn import pad_sequence
 
 class FashionIQDataset(Dataset):
-    def __init__(self, data_dir="data", category="dress"):
+    def __init__(self, data_dir="data", features_dir="data/features", category="dress"):
         """
         Khởi tạo Dataset. 
         Sẽ nạp toàn bộ đặc trưng ảnh (11GB) và đặc trưng chữ vào RAM.
         """
         self.data_dir = data_dir
+        self.features_dir = features_dir
         self.category = category
         
         # 1. Đọc file JSON và Text features
@@ -32,7 +33,7 @@ class FashionIQDataset(Dataset):
                 self.data.extend(cat_data)
                 
             # Load Text Features
-            text_feat_path = os.path.join(data_dir, f"features/{cat}_text_tokens.pt")
+            text_feat_path = os.path.join(features_dir, f"{cat}_text_tokens.pt")
             print(f"Loading text features from {text_feat_path}...")
             cat_text_features = torch.load(text_feat_path, map_location="cpu", weights_only=True)
             
@@ -42,13 +43,13 @@ class FashionIQDataset(Dataset):
                 global_idx += 1
                 
         # 2. Đọc file đặc trưng ảnh (Chỉ lấy CLS - Cực nhẹ)
-        image_feat_path = os.path.join(data_dir, "features/gallery_cls_768.pt")
+        image_feat_path = os.path.join(features_dir, "gallery_cls_768.pt")
         print(f"Loading image features (CLS only) from {image_feat_path}...")
         self.image_features = torch.load(image_feat_path, map_location="cpu", weights_only=True)
         print(f"Loaded {len(self.image_features)} image features.")
         
         # Load mapping file
-        with open(os.path.join(data_dir, "features/gallery_asins.json"), "r") as f:
+        with open(os.path.join(features_dir, "gallery_asins.json"), "r") as f:
             self.gallery_asins = json.load(f)
             
         # Create an asin to index mapping for fast lookup
@@ -64,7 +65,7 @@ class FashionIQDataset(Dataset):
         candidate_id = item['candidate']
         target_id = item['target']
         
-        # Lấy đặc trưng (shape: [768] cho ảnh, [seq_len, 768] cho text)
+        # Lấy đặc trưng (shape: [768] cho ảnh, [seq_len, 512] cho text)
         src_idx = self.asin_to_idx[candidate_id]
         tgt_idx = self.asin_to_idx[target_id]
         
@@ -94,7 +95,7 @@ def custom_collate_fn(batch):
     # Text features có độ dài (seq_len) khác nhau -> Phải đệm (Pad)
     # pad_sequence mong đợi list các tensor có dạng [L, *] và trả về [L, batch, *]
     # Truyền batch_first=True để trả về [batch, L, *]
-    txt_feats_padded = pad_sequence(txt_feats, batch_first=True, padding_value=0.0) # [batch, max_seq_len, 768]
+    txt_feats_padded = pad_sequence(txt_feats, batch_first=True, padding_value=0.0) # [batch, max_seq_len, 512]
     
     # Tạo text_attention_mask (True ở các vị trí có dữ liệu, False ở các vị trí padding)
     # Lấy chiều dài thật sự của từng text

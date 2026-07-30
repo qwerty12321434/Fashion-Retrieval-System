@@ -62,6 +62,7 @@ def main():
     parser.add_argument("--run_name", type=str, default="baseline_all", help="Prefix for checkpoint names")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs to train")
     parser.add_argument("--loss", type=str, default="infonce", choices=["infonce", "triplet"], help="Loss function to use")
+    parser.add_argument("--features_dir", type=str, default="data/features", help="Directory containing feature tensors")
     args = parser.parse_args()
 
     print("=== BẮT ĐẦU QUÁ TRÌNH HUẤN LUYỆN (DAY 3) ===")
@@ -78,7 +79,8 @@ def main():
         "temperature": 0.1,
         "dev_size": 300,
         "seed": 42,
-        "loss": args.loss
+        "loss": args.loss,
+        "features_dir": args.features_dir
     }
     
     # Tạo thư mục checkpoints
@@ -92,7 +94,7 @@ def main():
     
     # 2. Chuẩn bị Dữ liệu
     print("\n[1/4] Đang nạp toàn bộ Dataset (11GB) vào RAM...")
-    full_dataset = FashionIQDataset(data_dir="data", category="all")
+    full_dataset = FashionIQDataset(data_dir="data", features_dir=config["features_dir"], category="all")
     
     train_size = len(full_dataset) - config["dev_size"]
     train_subset, dev_subset = random_split(full_dataset, [train_size, config["dev_size"]])
@@ -116,7 +118,7 @@ def main():
     )
     
     # 3. Khởi tạo Mô hình & Tối ưu hóa
-    print("\n2. Khởi tạo Mô hình BaselineFusion...")
+    print("\n[2/4] Khởi tạo Mô hình BaselineFusion...")
     model = BaselineFusion(
         img_dim=768, 
         txt_dim=512, 

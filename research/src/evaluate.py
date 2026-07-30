@@ -17,12 +17,14 @@ def get_rank(sim_matrix, target_score):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate BaselineFusion model")
-    parser.add_argument("--ckpt", type=str, nargs='+', default=["baseline_infonce_best.pth", "baseline_triplet_best.pth"], help="One or more checkpoints to evaluate")
+    parser.add_argument("--ckpt", type=str, nargs='+', default=["baseline_infonce_1024_best.pth", "baseline_triplet_1024_best.pth"], help="One or more checkpoints to evaluate")
+    parser.add_argument("--features_dir", type=str, default="data/features", help="Thư mục chứa feature .pt files (dùng data/features_fashionclip cho FashionCLIP)")
     args = parser.parse_args()
 
     print("=== ĐÁNH GIÁ MÔ HÌNH (DAY 5) ===")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Sử dụng thiết bị: {device}")
+    print(f"[INFO] Features directory: {os.path.abspath(args.features_dir)}")
     
     print(f"\n[INFO] Checkpoints to evaluate: {args.ckpt}")
     for ckpt_file in args.ckpt:
@@ -30,13 +32,14 @@ def main():
         mtime = os.path.getmtime(ckpt_path) if os.path.exists(ckpt_path) else 0
         print(f"  - {ckpt_file} (modified: {time.ctime(mtime)})")
     
-    features_dir = "data/features"
+    features_dir = args.features_dir
     
     print("\n1. Đang nạp Gallery (Kho ảnh 74,381)...")
     gallery_cls_768 = torch.load(os.path.join(features_dir, "gallery_cls_768.pt"), map_location=device)
     gallery_embeds_512 = torch.load(os.path.join(features_dir, "gallery_embeds_512.pt"), map_location=device)
     with open(os.path.join(features_dir, "gallery_asins.json"), "r") as f:
         gallery_asins = json.load(f)
+        gallery_asin_to_idx = {asin: idx for idx, asin in enumerate(gallery_asins)}
         
     print("\n3. Đang nạp Validation Queries (Tất cả danh mục)...")
     val_data_all = []
@@ -96,11 +99,11 @@ def main():
             candidate_asin = item['candidate']
             target_asin = item['target']
             
-            if candidate_asin not in gallery_asins or target_asin not in gallery_asins:
+            if candidate_asin not in gallery_asin_to_idx or target_asin not in gallery_asin_to_idx:
                 continue
                 
-            candidate_idx = gallery_asins.index(candidate_asin)
-            target_idx = gallery_asins.index(target_asin)
+            candidate_idx = gallery_asin_to_idx[candidate_asin]
+            target_idx = gallery_asin_to_idx[target_asin]
             valid_queries += 1
             
             # --- ĐỐI THỦ 1: CLIP ZERO-SHOT ---
@@ -117,7 +120,7 @@ def main():
             # --- ĐỐI THỦ 2+: BASELINE FUSION (tất cả checkpoints) ---
             c_cls = gallery_cls_768[candidate_idx].unsqueeze(0) # [1, 768]
             t_hidden = val_hidden_all[i].unsqueeze(0) # [1, seq_len, 512]
-            t_eos = t_hidden[:, -1, :] # [1, 512]
+            t_eos = t_hidden[:, -1, :] # [1, 512] - Vị trí -1 luôn là EOS vì dữ liệu được trích xuất từng câu đơn lẻ (không padding)
             
             for m_idx, model in enumerate(models):
                 bf_query = model(c_cls, t_eos)
@@ -132,6 +135,10 @@ def main():
     print("\n=== KẾT QUẢ TỔNG HỢP ===")
     print(f"Tổng số truy vấn hợp lệ: {valid_queries}/{len(val_data_all)}")
     
+    if valid_queries == 0:
+        print("\n[CẢNH BÁO] Không có truy vấn hợp lệ nào! Kiểm tra lại --features_dir và gallery_asins.json")
+        return
+        
     print("\n1. CLIP ZERO-SHOT (Vector Addition)")
     print(f" - Recall@10: {recall_10_zs / valid_queries * 100:.2f}%")
     print(f" - Recall@50: {recall_50_zs / valid_queries * 100:.2f}%")
