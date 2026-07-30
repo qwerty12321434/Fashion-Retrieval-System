@@ -37,8 +37,16 @@ def main():
     features_dir = args.features_dir
     
     print("\n1. Đang nạp Gallery (Kho ảnh 74,381)...")
-    gallery_cls_768 = torch.load(os.path.join(features_dir, "gallery_cls_768.pt"), map_location=device)
-    gallery_embeds_512 = torch.load(os.path.join(features_dir, "gallery_embeds_512.pt"), map_location=device)
+    gallery_cls_768 = torch.load(
+        os.path.join(features_dir, "gallery_cls_768.pt"),
+        map_location=device,
+        weights_only=True
+    )
+    gallery_embeds_512 = torch.load(
+        os.path.join(features_dir, "gallery_embeds_512.pt"),
+        map_location=device,
+        weights_only=True
+    )
     with open(os.path.join(features_dir, "gallery_asins.json"), "r") as f:
         gallery_asins = json.load(f)
         gallery_asin_to_idx = {asin: idx for idx, asin in enumerate(gallery_asins)}
@@ -57,8 +65,16 @@ def main():
             data = json.load(f)
             val_data_all.extend(data)
             
-        hidden_dict = torch.load(os.path.join(features_dir, f"{cat}_val_text_hidden.pt"), map_location=device)
-        embed_dict = torch.load(os.path.join(features_dir, f"{cat}_val_text_embeds.pt"), map_location=device)
+        hidden_dict = torch.load(
+            os.path.join(features_dir, f"{cat}_val_text_hidden.pt"),
+            map_location=device,
+            weights_only=True
+        )
+        embed_dict = torch.load(
+            os.path.join(features_dir, f"{cat}_val_text_embeds.pt"),
+            map_location=device,
+            weights_only=True
+        )
         
         # Flatten dict into list based on indices
         val_hidden_all.extend([hidden_dict[i] for i in range(len(hidden_dict))])
@@ -82,7 +98,9 @@ def main():
             print("  Chạy trước: python scripts/prep_candidate_patches.py")
             return
         print(f"  Nạp candidate patch tokens từ {patch_path}...")
-        candidate_patch_tokens = torch.load(patch_path, map_location=device, weights_only=True)
+        candidate_patch_tokens = torch.load(
+            patch_path, map_location="cpu", weights_only=True, mmap=True
+        )
         print(f"  Đã nạp {len(candidate_patch_tokens)} ASIN patch tokens.")
 
     for ckpt_file in args.ckpt:
@@ -92,8 +110,7 @@ def main():
         if args.arch == "aacl":
             model = AACLFusion(img_dim=768, txt_dim=512, hidden_dim=768).to(device)
         else:
-            detected_hidden_dim = state_dict['mlp.0.weight'].shape[0] if 'mlp.0.weight' in state_dict else 1024
-            model = BaselineFusion(hidden_dim=detected_hidden_dim).to(device)
+            model = BaselineFusion(hidden_dim=1024).to(device)
         model.load_state_dict(state_dict)
         model.eval()
         models.append(model)
@@ -142,7 +159,7 @@ def main():
                 if args.arch == "aacl" and candidate_patch_tokens is not None:
                     # AACL: dùng patch tokens + full text sequence
                     patches = candidate_patch_tokens.get(
-                        candidate_asin, torch.zeros(50, 768, device=device)
+                        candidate_asin, torch.zeros(50, 768)
                     ).unsqueeze(0).to(device)   # [1, 50, 768]
                     # tạo mask (toàn bộ real vì val text không có padding trong trường hợp 1 mẫu)
                     t_mask = torch.ones(1, t_hidden.size(1), device=device, dtype=torch.bool)

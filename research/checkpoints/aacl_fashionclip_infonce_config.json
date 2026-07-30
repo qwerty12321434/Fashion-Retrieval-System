@@ -1,5 +1,6 @@
 {
-    "run_name": "baseline_infonce_512",
+    "run_name": "aacl_fashionclip_infonce",
+    "arch": "aacl",
     "batch_size": 256,
     "epochs": 50,
     "lr": 0.0001,
@@ -8,6 +9,5 @@
     "dev_size": 300,
     "seed": 42,
     "loss": "infonce",
-    "hidden_dim": 512,
-    "sampler": "random"
+    "features_dir": "data/features_fashionclip"
 }

@@ -46,7 +46,7 @@ def main():
         return
 
     print(f"\n[2/3] Đang nạp {all_tokens_path} vào RAM (có thể mất 1-2 phút)...")
-    all_tokens = torch.load(all_tokens_path, weights_only=True)
+    all_tokens = torch.load(all_tokens_path, weights_only=True, mmap=True)
     print(f"  Đã nạp {len(all_tokens)} ASIN, mỗi ASIN shape: {next(iter(all_tokens.values())).shape}")
 
     # 3. Lọc và lưu
@@ -55,7 +55,9 @@ def main():
     missing  = []
     for asin in candidate_asins:
         if asin in all_tokens:
-            filtered[asin] = all_tokens[asin]  # tensor [50, 768]
+            # Clone để tách khỏi storage batch lớn của all_image_tokens.pt.
+            # Nếu giữ tensor view, torch.save sẽ ghi gần như toàn bộ file 11GB.
+            filtered[asin] = all_tokens[asin].clone()  # tensor [50, 768]
         else:
             missing.append(asin)
 
@@ -68,7 +70,9 @@ def main():
             print(f"    ... (còn {len(missing) - 5} nữa)")
 
     out_path = os.path.join(features_dir, "candidate_patch_tokens.pt")
-    torch.save(filtered, out_path)
+    temp_path = out_path + ".tmp"
+    torch.save(filtered, temp_path)
+    os.replace(temp_path, out_path)
     size_mb = os.path.getsize(out_path) / (1024 ** 2)
     print(f"\n  [OK] Đã lưu {len(filtered)} candidate patch tensors -> {out_path}")
     print(f"  Kích thước file: {size_mb:.1f} MB")

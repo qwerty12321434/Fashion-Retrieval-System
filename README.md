@@ -21,11 +21,14 @@ Mục tiêu: kết hợp *ảnh gốc* và *câu lệnh ngôn ngữ tự nhiên*
 | Mô hình | Kiến trúc | R@10 | R@50 | Checkpoint |
 |---------|-----------|------|------|------------|
 | Zero-shot Vector Addition | — | 10.32% | 22.39% | — |
-| BaselineFusion + InfoNCE | MLP (CLS+EOS) | 9.18% | 21.13% | `fashionclip_infonce_1024_best.pth` |
-| BaselineFusion + Triplet | MLP (CLS+EOS) | 12.88% | **26.56%** | `fashionclip_triplet_1024_best.pth` |
-| **AACLFusion + Triplet** | Additive Attention (50 patches + full text) | **12.45%** | 25.66% | `aacl_fashionclip_triplet_best.pth` |
+| BaselineFusion + InfoNCE | MLP (CLS+EOS) | 9.18% | 21.14% | `fashionclip_infonce_1024_best.pth` |
+| BaselineFusion + Triplet | MLP (CLS+EOS) | 12.88% | 26.56% | `fashionclip_triplet_1024_best.pth` |
+| BaselineFusion + Batch Classification | MLP (CLS+EOS) | 11.88% | 27.11% | `fashionclip_batchcls_1024_best.pth` |
+| AACLFusion + Triplet | Additive Attention (50 patches + full text) | 12.45% | 25.66% | `aacl_fashionclip_triplet_best.pth` |
+| AACLFusion + Batch Classification | Additive Attention (50 tokens + full text) | 12.53% | 26.88% | `aacl_fashionclip_batchcls_best.pth` |
+| **AACLFusion + InfoNCE** | Additive Attention (50 patches + full text) | **13.76%** | **27.78%** | `aacl_fashionclip_infonce_best.pth` |
 
-> **Key Insight (Phase B):** AACLFusion tái hiện đúng cơ chế AACL paper — dùng toàn bộ 50 patch token ảnh và full text sequence thay vì chỉ CLS+EOS. Kết quả tương đương BaselineFusion (R@10: 12.45% vs 12.88%), cho thấy context vector đơn lẻ `c` trong AACL chưa đủ mạnh để xử lý câu lệnh nhiều thuộc tính — đây là điểm yếu cụ thể sẽ được giải quyết ở **Phase D (AttentionFusion multi-head)**.
+> **Key Insight (Phase B):** Biến thể AACL-inspired single-head với InfoNCE vẫn cho kết quả cao nhất (**R@10: 13.76%, R@50: 27.78%**). Batch Classification một chiều theo công thức AACL paper cải thiện BaselineFusion so với InfoNCE và đạt R@50 cao nhất trong ba loss của Baseline, nhưng chưa vượt Triplet ở R@10 và chưa vượt InfoNCE trên AACLFusion. Điều này cho thấy loss gốc của paper không tự động chuyển thành loss tốt nhất khi dùng frozen FashionCLIP và kiến trúc AACL rút gọn.
 
 ---
 
@@ -42,10 +45,10 @@ FashionSystem/
     │   │   └── dataset.py                  # FashionIQDataset, CategoryBatchSampler
     │   └── models/
     │       ├── model.py                    # BaselineFusion, AdditiveAttention
-    │       └── loss.py                     # CIRLoss (InfoNCE), CIRTripletLoss
+    │       └── loss.py                     # InfoNCE, Triplet, Batch Classification
     ├── scripts/
-    │   ├── extract_features.py             # Trích xuất feature bằng CLIP-base
-    │   └── extract_features_fashionclip.py # Trích xuất feature bằng FashionCLIP ⭐
+    │   ├── extract_features.py             # Trích xuất CLIP-base/FashionCLIP
+    │   └── prep_candidate_patches.py       # Lọc candidate token cho AACL
     ├── data/
     │   ├── json/                           # FashionIQ annotation files
     │   ├── features/                       # Features từ CLIP-base
@@ -86,6 +89,7 @@ Query [768]  ──[Cosine Similarity]──> Gallery [74381, 768] ──> Top-K
 |------|-------|-------|
 | InfoNCE | `CIRLoss` | Phạt tất cả negatives trong batch — hiệu quả khi không gian embedding hỗn loạn |
 | Triplet | `CIRTripletLoss` | Chỉ phạt negative quá gần positive — tốt hơn khi không gian đã có cấu trúc (FashionCLIP) |
+| Batch Classification | `CIRBatchClassificationLoss` | Loss một chiều query→target theo AACL paper; softmax trên toàn bộ target trong batch |
 
 ---
 
@@ -127,6 +131,10 @@ python scripts/extract_features.py --backbone fashionclip
 # CLIP-base features (pipeline cũ, để so sánh)
 python scripts/extract_features.py --backbone clip-base
 # Output: data/features/
+
+# (Chỉ cần 1 lần) Lọc patch tokens cho AACL — bắt buộc trước khi train --arch aacl
+# Input: all_image_tokens.pt (~11GB) | Output dự kiến sau clone: candidate_patch_tokens.pt (~2.5GB)
+python scripts/prep_candidate_patches.py
 ```
 
 ### 3. Huấn Luyện
@@ -141,6 +149,12 @@ python src/train.py --run_name baseline_triplet_1024 --loss triplet --epochs 50
 # === FashionCLIP (khuyên dùng) ===
 python src/train.py --run_name fashionclip_infonce_1024 --loss infonce --features_dir data/features_fashionclip
 python src/train.py --run_name fashionclip_triplet_1024 --loss triplet  --features_dir data/features_fashionclip
+python src/train.py --run_name fashionclip_batchcls_1024 --loss batch_cls --features_dir data/features_fashionclip
+
+# === AACL ===
+python src/train.py --arch aacl --run_name aacl_fashionclip_infonce --loss infonce --features_dir data/features_fashionclip --epochs 50
+python src/train.py --arch aacl --run_name aacl_fashionclip_triplet --loss triplet --features_dir data/features_fashionclip --epochs 50
+python src/train.py --arch aacl --run_name aacl_fashionclip_batchcls --loss batch_cls --features_dir data/features_fashionclip --epochs 50
 ```
 
 Checkpoint tốt nhất tự động lưu tại `checkpoints/{run_name}_best.pth`.
@@ -150,32 +164,57 @@ Checkpoint tốt nhất tự động lưu tại `checkpoints/{run_name}_best.pth
 ```bash
 cd research
 
-# So sánh nhiều checkpoint cùng lúc (cùng features_dir)
+# === BaselineFusion (MLP: CLS + EOS) ===
 python src/evaluate.py \
-  --ckpt fashionclip_infonce_1024_best.pth fashionclip_triplet_1024_best.pth \
+  --ckpt fashionclip_infonce_1024_best.pth fashionclip_triplet_1024_best.pth fashionclip_batchcls_1024_best.pth \
+  --features_dir data/features_fashionclip
+
+# === AACLFusion (Additive Attention: 50 patches + full text) ===
+python src/evaluate.py --arch aacl \
+  --ckpt aacl_fashionclip_infonce_best.pth aacl_fashionclip_triplet_best.pth aacl_fashionclip_batchcls_best.pth \
   --features_dir data/features_fashionclip
 ```
 
 ### 5. Demo Trực Quan
 
+`demo.py` hỗ trợ hai chế độ:
+
+- **Validation offline:** tự lấy candidate, modifier và target thật từ FashionIQ; không cần tải backbone. Ảnh output hiển thị full-gallery rank và viền xanh target.
+- **Free-form:** nhập ASIN và modifier tùy ý; cần backbone Hugging Face đã cache hoặc có kết nối mạng.
+
 ```bash
 cd research
 
-# Demo với CLIP-base
+# === Validation offline: Baseline + Batch Classification ===
 python src/demo.py \
-  --candidate "B00FHFMMMW" \
-  --text "is softly colored, has no shoulder straps and looser skirt" \
-  --ckpt baseline_infonce_1024_best.pth \
-  --output demo_result.png
+  --category dress --val_index 1 \
+  --ckpt fashionclip_batchcls_1024_best.pth \
+  --arch baseline --top_k 5 \
+  --output demo_baseline_batchcls.png
 
-# Demo với FashionCLIP (backbone và features_dir phải đồng bộ với checkpoint!)
+# === Validation offline: AACL-inspired + Batch Classification ===
+python src/demo.py \
+  --category dress --val_index 1 \
+  --ckpt aacl_fashionclip_batchcls_best.pth \
+  --arch aacl --top_k 5 \
+  --output demo_aacl_batchcls.png
+
+# === Free-form: BaselineFusion + Triplet ===
 python src/demo.py \
   --candidate "B00FHFMMMW" \
   --text "is softly colored, has no shoulder straps and looser skirt" \
   --ckpt fashionclip_triplet_1024_best.pth \
-  --backbone patrickjohncyh/fashion-clip \
-  --features_dir data/features_fashionclip \
-  --output demo_fashionclip.png
+  --output demo_baseline_triplet.png
+
+# === Free-form: AACL-inspired + InfoNCE ===
+python src/demo.py --arch aacl \
+  --candidate "B00FHFMMMW" \
+  --text "is softly colored, has no shoulder straps and looser skirt" \
+  --ckpt aacl_fashionclip_infonce_best.pth \
+  --output demo_aacl_infonce.png
+
+# Nếu biết target thật trong free-form mode:
+# thêm --target TARGET_ASIN để tính rank và highlight.
 ```
 
 ---

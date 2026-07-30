@@ -71,7 +71,11 @@ class FashionIQDataset(Dataset):
                     "Hãy chạy trước: python scripts/prep_candidate_patches.py"
                 )
             print(f"Loading candidate patch tokens (AACL) from {patch_path}...")
-            self.patch_features = torch.load(patch_path, map_location="cpu", weights_only=True)
+            # mmap tránh nạp toàn bộ artifact patch vào RAM ngay khi khởi tạo.
+            # Điều này cũng giúp đọc được artifact cũ vốn giữ storage 11GB.
+            self.patch_features = torch.load(
+                patch_path, map_location="cpu", weights_only=True, mmap=True
+            )
             print(f"  Loaded patch tokens for {len(self.patch_features)} candidate ASINs.")
 
     def __len__(self):

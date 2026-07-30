@@ -1,0 +1,17 @@
+{
+    "run_name": "fashionclip_batchcls_1024",
+    "arch": "baseline",
+    "batch_size": 256,
+    "epochs": 50,
+    "lr": 0.0001,
+    "weight_decay": 0.0001,
+    "temperature": 0.1,
+    "dev_size": 300,
+    "seed": 42,
+    "loss": "batch_cls",
+    "features_dir": "data/features_fashionclip",
+    "loss_similarity": "dot",
+    "loss_normalize": false,
+    "loss_temperature": null,
+    "loss_symmetric": false
+}

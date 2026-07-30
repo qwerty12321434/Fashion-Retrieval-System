@@ -14,7 +14,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 from data.dataset import FashionIQDataset, custom_collate_fn, aacl_collate_fn, CategoryBatchSampler
 from models.model import BaselineFusion, AACLFusion
-from models.loss import CIRLoss, CIRTripletLoss
+from models.loss import CIRLoss, CIRTripletLoss, CIRBatchClassificationLoss
 
 def eval_accuracy(model, dataloader, device, arch="baseline"):
     """
@@ -60,7 +60,13 @@ def main():
     parser = argparse.ArgumentParser(description="Train BaselineFusion / AACLFusion model")
     parser.add_argument("--run_name", type=str, default="baseline_all", help="Prefix for checkpoint names")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs to train")
-    parser.add_argument("--loss", type=str, default="infonce", choices=["infonce", "triplet"], help="Loss function to use")
+    parser.add_argument(
+        "--loss",
+        type=str,
+        default="infonce",
+        choices=["infonce", "triplet", "batch_cls"],
+        help="Loss function to use",
+    )
     parser.add_argument("--features_dir", type=str, default="data/features", help="Directory containing feature tensors")
     parser.add_argument("--arch", type=str, default="baseline", choices=["baseline", "aacl"],
                         help="Mô hình: baseline=BaselineFusion (CLS+EOS), aacl=AACLFusion (patches+full text)")
@@ -84,6 +90,13 @@ def main():
         "loss"        : args.loss,
         "features_dir": args.features_dir
     }
+    if args.loss == "batch_cls":
+        config.update({
+            "loss_similarity" : "dot",
+            "loss_normalize"  : False,
+            "loss_temperature": None,
+            "loss_symmetric"  : False
+        })
     
     # Tạo thư mục checkpoints
     os.makedirs("checkpoints", exist_ok=True)
@@ -128,6 +141,13 @@ def main():
     if config["loss"] == "triplet":
         criterion = CIRTripletLoss(margin=0.2).to(device)
         print(f"   Hàm Loss: TripletMarginLoss (margin=0.2)")
+    elif config["loss"] == "batch_cls":
+        criterion = CIRBatchClassificationLoss(
+            normalize=config["loss_normalize"],
+            temperature=config["loss_temperature"],
+            symmetric=config["loss_symmetric"]
+        ).to(device)
+        print("   Hàm Loss: AACL Batch Classification (one-way dot product)")
     else:
         criterion = CIRLoss(temperature=config["temperature"]).to(device)
         print(f"   Hàm Loss: InfoNCE (temperature={config['temperature']})")

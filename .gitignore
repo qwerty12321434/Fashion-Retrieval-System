@@ -2,6 +2,11 @@
 venv/
 __pycache__/
 *.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Bỏ qua dữ liệu thô và các file đặc trưng Tensor (Hàng chục GB)
 research/data/features/
@@ -12,10 +17,15 @@ research/data/json/
 # Bỏ qua các file trọng số mô hình (chỉ giữ lại config.json)
 research/checkpoints/*.pth
 
+# Báo cáo nội bộ và test thử nghiệm chỉ lưu local
+research/reports/
+research/tests/
+
 # Bỏ qua ảnh kết quả demo (sinh ra khi chạy demo.py)
 research/demo_result*.png
 research/demo_fashionclip*.png
 *.png
+*.tmp
 
 # Bỏ qua các file rác của hệ điều hành
 .DS_Store
