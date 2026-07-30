@@ -9,7 +9,7 @@ class FashionIQDataset(Dataset):
     def __init__(self, data_dir="data", features_dir="data/features", category="dress"):
         """
         Khởi tạo Dataset. 
-        Sẽ nạp toàn bộ đặc trưng ảnh (11GB) và đặc trưng chữ vào RAM.
+        Sẽ nạp toàn bộ đặc trưng ảnh (228MB cho CLS token) và đặc trưng chữ vào RAM để tăng tốc.
         """
         self.data_dir = data_dir
         self.features_dir = features_dir

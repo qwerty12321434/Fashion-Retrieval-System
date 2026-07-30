@@ -1,6 +1,7 @@
 import os
 import sys
 import io
+import argparse
 import json
 import torch
 from PIL import Image
@@ -9,115 +10,285 @@ from transformers import CLIPProcessor, CLIPModel
 from torch.utils.data import Dataset, DataLoader
 import glob
 
-# Ép Windows Terminal dùng UTF-8 để không bị lỗi font tiếng Việt
+# Ép Windows Terminal dùng UTF-8
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-# 1. Cấu hình đường dẫn
-IMAGE_DIR = r"E:\MyDownloads\fashion-iq-dataset\fashionIQ_dataset\images"
-OUTPUT_DIR = "data/features"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# Cấu hình tĩnh đã được chuyển vào argparse
 
-# Tối ưu hóa: Dùng Dataset và DataLoader để chạy Batch
+# =============================================================================
+# DATASET CHO ẢNH (Batch loading)
+# =============================================================================
 def custom_collate(batch):
     return tuple(zip(*batch))
 
 class FashionImageDataset(Dataset):
     def __init__(self, image_dir, image_files, processor):
-        self.image_dir = image_dir
+        self.image_dir   = image_dir
         self.image_files = image_files
-        self.processor = processor
+        self.processor   = processor
 
     def __len__(self):
         return len(self.image_files)
 
     def __getitem__(self, idx):
         img_file = self.image_files[idx]
-        asin = img_file.split('.')[0]
+        asin     = img_file.split('.')[0]
         img_path = os.path.join(self.image_dir, img_file)
         try:
-            image = Image.open(img_path).convert("RGB")
-            # Chỉ preprocess ảnh trả về tensor
+            image  = Image.open(img_path).convert("RGB")
             inputs = self.processor(images=image, return_tensors="pt")
             return asin, inputs['pixel_values'].squeeze(0)
-        except Exception as e:
+        except Exception:
             return asin, None
 
-def extract_image_features(model, processor, device):
-    print("--- Trích xuất Image Features ---")
-    if not os.path.exists(IMAGE_DIR):
-        print(f"Thư mục {IMAGE_DIR} không tồn tại.")
+# =============================================================================
+# BƯỚC 1: TRÍCH XUẤT TOÀN BỘ IMAGE TOKENS (all_image_tokens.pt)
+# =============================================================================
+def extract_image_features(model, processor, device, image_dir, output_dir, model_name):
+    """
+    Trích xuất last_hidden_state của vision_model cho toàn bộ ảnh trong image_dir.
+    Output: all_image_tokens.pt  — dict{asin: tensor[50, 768]}
+    Dung lượng ước tính: ~11GB
+    """
+    print("\n" + "="*60)
+    print(f"[BƯỚC 1/4] Trích xuất Image Features ({model_name} Vision)")
+    print("="*60)
+
+    if not os.path.exists(image_dir):
+        print(f"  [LỖI] Thư mục ảnh không tồn tại: {image_dir}")
         return
-        
-    image_files = [f for f in os.listdir(IMAGE_DIR) if f.endswith(('.jpg', '.png'))]
-    if len(image_files) == 0:
-        print("Không tìm thấy ảnh.")
+
+    image_files = [f for f in os.listdir(image_dir) if f.endswith(('.jpg', '.png'))]
+    if not image_files:
+        print("  [LỖI] Không tìm thấy ảnh trong image_dir.")
         return
-        
-    dataset = FashionImageDataset(IMAGE_DIR, image_files, processor)
-    
-    # RTX 4050 6GB VRAM có thể gánh batch_size 128 hoặc 256. Để 128 là cực kỳ an toàn.
-    # num_workers=4 giúp CPU đọc ảnh song song nhanh hơn rất nhiều.
-    dataloader = DataLoader(dataset, batch_size=128, shuffle=False, num_workers=4, collate_fn=custom_collate)
-    
+
+    print(f"  Tổng số ảnh: {len(image_files)}")
+    print(f"  Model: {model_name}")
+
+    dataset    = FashionImageDataset(image_dir, image_files, processor)
+    # num_workers=4 tăng tốc đọc ảnh trên Windows (đã an toàn vì model init trong main + if __name__ == "__main__" guard)
+    dataloader = DataLoader(dataset, batch_size=128, shuffle=False,
+                            num_workers=4, collate_fn=custom_collate)
+
     image_features_dict = {}
-    
+
     with torch.no_grad():
-        for batch_asins, batch_images in tqdm(dataloader):
-            valid_idx = [i for i, img in enumerate(batch_images) if img is not None]
-            if not valid_idx: continue
-            
-            valid_asins = [batch_asins[i] for i in valid_idx]
+        for batch_asins, batch_images in tqdm(dataloader, desc="Extracting images"):
+            valid_idx    = [i for i, img in enumerate(batch_images) if img is not None]
+            if not valid_idx:
+                continue
+            valid_asins  = [batch_asins[i] for i in valid_idx]
             valid_images = torch.stack([batch_images[i] for i in valid_idx]).to(device)
-            
-            outputs = model.vision_model(pixel_values=valid_images)
-            tokens_batch = outputs.last_hidden_state.cpu()
-            
+
+            outputs      = model.vision_model(pixel_values=valid_images)
+            tokens_batch = outputs.last_hidden_state.cpu()  # [B, 50, 768]
+
             for i, asin in enumerate(valid_asins):
                 image_features_dict[asin] = tokens_batch[i]
-                
-    torch.save(image_features_dict, os.path.join(OUTPUT_DIR, "all_image_tokens.pt"))
-    print(f"Đã lưu {len(image_features_dict)} image features vào all_image_tokens.pt!")
 
-def extract_text_features(model, processor, device):
-    print("--- Trích xuất Text Features ---")
-    json_files = glob.glob("data/json/*.json")
-    
+    out_path = os.path.join(output_dir, "all_image_tokens.pt")
+    torch.save(image_features_dict, out_path)
+    print(f"  [OK] Đã lưu {len(image_features_dict)} image tokens -> {out_path}")
+
+# =============================================================================
+# BƯỚC 2: CHUẨN BỊ GALLERY (gallery_cls_768.pt + gallery_embeds_512.pt)
+# =============================================================================
+def prepare_gallery(model, device, output_dir):
+    """
+    Từ all_image_tokens.pt:
+      - Cắt CLS token [0, :] -> gallery_cls_768.pt  [N, 768]
+      - Chiếu qua post_layernorm + visual_projection -> gallery_embeds_512.pt  [N, 512]
+      - Lưu danh sách ASIN -> gallery_asins.json
+    """
+    print("\n" + "="*60)
+    print("[BƯỚC 2/4] Chuẩn bị Gallery (CLS + Projected Embeds)")
+    print("="*60)
+
+    all_tokens_path = os.path.join(output_dir, "all_image_tokens.pt")
+    print(f"  Nạp {all_tokens_path} ...")
+    all_image_tokens = torch.load(all_tokens_path)
+
+    asins    = list(all_image_tokens.keys())
+    cls_list = [all_image_tokens[asin][0, :] for asin in asins]
+    gallery_cls_768 = torch.stack(cls_list)  # [N, 768]
+
+    # Lưu danh sách ASIN
+    asins_path = os.path.join(output_dir, "gallery_asins.json")
+    with open(asins_path, "w") as f:
+        json.dump(asins, f)
+    print(f"  [OK] Đã lưu {len(asins)} ASINs -> {asins_path}")
+
+    # Lưu CLS features
+    cls_path = os.path.join(output_dir, "gallery_cls_768.pt")
+    torch.save(gallery_cls_768, cls_path)
+    print(f"  [OK] Đã lưu gallery_cls_768.pt  shape={gallery_cls_768.shape}")
+
+    # Giải phóng RAM trước khi tính embeddings
+    del all_image_tokens
+
+    # Tính projected embeddings (512-dim) cho Zero-shot CLIP
+    print("  Đang chiếu CLS qua post_layernorm + visual_projection...")
+    batch_size         = 4096
+    gallery_embeds_512 = []
+
+    with torch.no_grad():
+        for i in range(0, len(gallery_cls_768), batch_size):
+            batch = gallery_cls_768[i:i+batch_size].to(device)
+            x     = model.vision_model.post_layernorm(batch)
+            x     = model.visual_projection(x)
+            gallery_embeds_512.append(x.cpu())
+
+    gallery_embeds_512 = torch.cat(gallery_embeds_512, dim=0)
+    embeds_path        = os.path.join(output_dir, "gallery_embeds_512.pt")
+    torch.save(gallery_embeds_512, embeds_path)
+    print(f"  [OK] Đã lưu gallery_embeds_512.pt  shape={gallery_embeds_512.shape}")
+
+# =============================================================================
+# BƯỚC 3: TRÍCH XUẤT TEXT FEATURES (TRAIN)
+# =============================================================================
+def extract_train_text(model, processor, device, output_dir):
+    """
+    Trích xuất last_hidden_state của text_model cho toàn bộ triplets train.
+    Output: {dress,shirt,toptee}_text_tokens.pt  — dict{idx: tensor[seq_len, 512]}
+    """
+    print("\n" + "="*60)
+    print("[BƯỚC 3/4] Trích xuất Train Text Features")
+    print("="*60)
+
+    json_files = glob.glob("data/json/cap.*.train.json")
     if not json_files:
-        print("Không tìm thấy file JSON nào trong data/json/")
+        print("  [CANH BAO] Không tìm thấy file JSON train trong data/json/")
         return
-        
+
     for json_path in json_files:
-        print(f"\nĐang xử lý: {os.path.basename(json_path)}")
+        print(f"\n  Đang xử lý: {os.path.basename(json_path)}")
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            
+
         text_features_dict = {}
         with torch.no_grad():
-            for idx, item in enumerate(tqdm(data)):
-                text = " and ".join(item['captions'])
-                inputs = processor(text=text, return_tensors="pt", padding=True, truncation=True).to(device)
+            for idx, item in enumerate(tqdm(data, desc="  Train text")):
+                text   = " and ".join(item['captions'])
+                inputs = processor(text=text, return_tensors="pt",
+                                   padding=True, truncation=True).to(device)
                 outputs = model.text_model(**inputs)
+                # last_hidden_state: [1, seq_len, 512]
                 text_features_dict[idx] = outputs.last_hidden_state.squeeze(0).cpu()
-                
-        category = os.path.basename(json_path).split('.')[1]
+
+        # Tên file dựa theo danh mục: cap.dress.train.json -> dress_text_tokens.pt
+        category        = os.path.basename(json_path).split('.')[1]
         output_filename = f"{category}_text_tokens.pt"
-        torch.save(text_features_dict, os.path.join(OUTPUT_DIR, output_filename))
-        print(f"Đã lưu {len(text_features_dict)} text features vào {output_filename}!")
+        out_path        = os.path.join(output_dir, output_filename)
+        torch.save(text_features_dict, out_path)
+        print(f"  [OK] Đã lưu {len(text_features_dict)} train captions -> {out_path}")
 
+# =============================================================================
+# BƯỚC 4: TRÍCH XUẤT TEXT FEATURES (VALIDATION)
+# =============================================================================
+def extract_val_text(model, processor, device, output_dir):
+    """
+    Trích xuất text features cho validation queries.
+    Output (mỗi danh mục):
+      - {cat}_val_text_hidden.pt  — dict{idx: tensor[seq_len, 512]}  (cho BaselineFusion)
+      - {cat}_val_text_embeds.pt  — dict{idx: tensor[512]}           (cho Zero-shot CLIP)
+
+    EOS token: dùng argmax(input_ids) để tìm đúng vị trí <|endoftext|> (ID=49407).
+    """
+    print("\n" + "="*60)
+    print("[BƯỚC 4/4] Trích xuất Validation Text Features")
+    print("="*60)
+
+    categories = ['dress', 'shirt', 'toptee']
+
+    for category in categories:
+        val_json_path = f"data/json/cap.{category}.val.json"
+        if not os.path.exists(val_json_path):
+            print(f"  Bỏ qua {category}: không tìm thấy {val_json_path}")
+            continue
+
+        print(f"\n  Đang xử lý val/{category} ...")
+        with open(val_json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        hidden_dict = {}
+        embed_dict  = {}
+
+        with torch.no_grad():
+            for idx, item in enumerate(tqdm(data, desc=f"  Val {category}")):
+                caption = " and ".join(item['captions'])
+                inputs  = processor(text=caption, return_tensors="pt",
+                                    padding=True, truncation=True).to(device)
+
+                outputs           = model.text_model(**inputs)
+                last_hidden_state = outputs.last_hidden_state  # [1, seq_len, 512]
+
+                # EOS token: vị trí có input_id cao nhất
+                eos_idx     = inputs.input_ids.to(torch.int).argmax(dim=-1)
+                pooled      = last_hidden_state[
+                    torch.arange(last_hidden_state.shape[0], device=device), eos_idx
+                ]
+                text_embeds = model.text_projection(pooled)  # [1, 512]
+
+                hidden_dict[idx] = last_hidden_state.squeeze(0).cpu()  # [seq_len, 512]
+                embed_dict[idx]  = text_embeds.squeeze(0).cpu()        # [512]
+
+        hidden_path = os.path.join(output_dir, f"{category}_val_text_hidden.pt")
+        embed_path  = os.path.join(output_dir, f"{category}_val_text_embeds.pt")
+        torch.save(hidden_dict, hidden_path)
+        torch.save(embed_dict,  embed_path)
+        print(f"  [OK] {category}: {len(hidden_dict)} queries -> hidden + embeds đã lưu")
+
+# =============================================================================
+# MAIN
+# =============================================================================
 def main():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    parser = argparse.ArgumentParser(description="Trích xuất đặc trưng với CLIP")
+    parser.add_argument("--backbone", type=str, choices=["clip-base", "fashionclip"], default="fashionclip", help="Chọn backbone để trích xuất")
+    parser.add_argument("--image_dir", type=str, default=r"E:\MyDownloads\fashion-iq-dataset\fashionIQ_dataset\images", help="Thư mục chứa ảnh gốc")
+    args = parser.parse_args()
 
-    # Đưa việc khởi tạo Model vào trong main() để tránh lỗi kẹt GPU khi dùng num_workers > 0 trên Windows
-    model_name = "openai/clip-vit-base-patch32" # model Vision Transformer (ViT) của OpenAI
+    # Thiết lập cấu hình theo backbone
+    if args.backbone == "fashionclip":
+        model_name = "patrickjohncyh/fashion-clip"
+        output_dir = "data/features_fashionclip"
+    else:
+        model_name = "openai/clip-vit-base-patch32"
+        output_dir = "data/features"
+        
+    os.makedirs(output_dir, exist_ok=True)
+
+    print("=" * 60)
+    print(f"  TRÍCH XUẤT ĐẶC TRƯNG VỚI {args.backbone.upper()}")
+    print(f"  Model : {model_name}")
+    print(f"  Output: {os.path.abspath(output_dir)}")
+    print("=" * 60)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"  Device: {device}")
+
+    print(f"\n  Đang tải mô hình từ HuggingFace...")
     processor = CLIPProcessor.from_pretrained(model_name)
-    model = CLIPModel.from_pretrained(model_name, use_safetensors=True).to(device) 
+    model     = CLIPModel.from_pretrained(model_name, use_safetensors=True).to(device)
     model.eval()
+    print(f"  [OK] Mô hình đã tải xong!")
 
-    # Bật lại cả 2 hàm để extract toàn bộ từ đầu
-    extract_image_features(model, processor, device)
-    extract_text_features(model, processor, device)
-    print("🎉 Hoàn thành xuất đặc trưng Ngày 1!")
+    # Xác nhận output dims đúng như kỳ vọng
+    print(f"\n  [INFO] Vision hidden dim : {model.config.vision_config.hidden_size}  (kỳ vọng: 768)")
+    print(f"  [INFO] Text hidden dim   : {model.config.text_config.hidden_size}   (kỳ vọng: 512)")
+    print(f"  [INFO] Projection dim    : {model.config.projection_dim}            (kỳ vọng: 512)")
+
+    extract_image_features(model, processor, device, args.image_dir, output_dir, model_name)  # ~30-60 phut
+    prepare_gallery(model, device, output_dir)                     # ~2-5 phut
+    extract_train_text(model, processor, device, output_dir)       # ~5-10 phut
+    extract_val_text(model, processor, device, output_dir)         # ~3-5 phut
+    
+    print("\n" + "=" * 60)
+    print(f"  HOÀN TẤT! Toàn bộ features đã lưu tại:")
+    print(f"  {os.path.abspath(output_dir)}")
+    print("\n  Để đánh giá mô hình, chạy lệnh:")
+    print(f"  python src/evaluate.py --features_dir {output_dir}")
+    print("=" * 60)
 
 if __name__ == "__main__":
     main()

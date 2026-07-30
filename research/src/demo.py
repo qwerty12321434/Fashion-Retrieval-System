@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--ckpt", type=str, default="baseline_all_best.pth", help="Checkpoint to load")
     parser.add_argument("--backbone", type=str, default="openai/clip-vit-base-patch32", help="Mô hình backbone sử dụng")
     parser.add_argument("--features_dir", type=str, default="data/features", help="Thư mục chứa feature của kho ảnh")
+    parser.add_argument("--image_dir", type=str, default=r"E:\MyDownloads\fashion-iq-dataset\fashionIQ_dataset\images", help="Thư mục chứa ảnh gốc")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -54,7 +55,7 @@ def main():
         gallery_asins = json.load(f)
 
     # 3. Trích xuất đặc trưng cho Candidate Image
-    image_dir = r"E:\MyDownloads\fashion-iq-dataset\fashionIQ_dataset\images"
+    image_dir = args.image_dir
     candidate_path = os.path.join(image_dir, f"{args.candidate}.jpg")
     if not os.path.exists(candidate_path):
         candidate_path = os.path.join(image_dir, f"{args.candidate}.png")

@@ -17,7 +17,7 @@ def get_rank(sim_matrix, target_score):
 
 def main():
     parser = argparse.ArgumentParser(description="Evaluate BaselineFusion model")
-    parser.add_argument("--ckpt", type=str, nargs='+', default=["baseline_infonce_1024_best.pth", "baseline_triplet_1024_best.pth"], help="One or more checkpoints to evaluate")
+    parser.add_argument("--ckpt", type=str, nargs='+', required=True, help="One or more checkpoints to evaluate (e.g., fashionclip_triplet_1024_best.pth)")
     parser.add_argument("--features_dir", type=str, default="data/features", help="Thư mục chứa feature .pt files (dùng data/features_fashionclip cho FashionCLIP)")
     args = parser.parse_args()
 

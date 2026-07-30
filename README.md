@@ -24,7 +24,7 @@ Mục tiêu: kết hợp *ảnh gốc* và *câu lệnh ngôn ngữ tự nhiên*
 | BaselineFusion + InfoNCE | 9.18% | 21.13% | `fashionclip_infonce_1024_best.pth` |
 | **BaselineFusion + Triplet** | **12.88%** | **26.56%** | `fashionclip_triplet_1024_best.pth` |
 
-> **Key Insight:** FashionCLIP (fine-tuned trên ~70K sản phẩm thời trang) kết hợp Triplet Loss đạt hiệu năng tốt nhất. FashionCLIP tạo ra không gian embedding đã có cấu trúc tốt cho domain thời trang, nên Triplet Loss (với margin) bảo toàn cấu trúc đó tốt hơn InfoNCE vốn đẩy mạnh toàn bộ negatives ra xa.
+> **Key Insight:** FashionCLIP (fine-tuned trên ~700K sản phẩm thời trang) kết hợp Triplet Loss đạt hiệu năng tốt nhất. FashionCLIP tạo ra không gian embedding đã có cấu trúc tốt cho domain thời trang, nên Triplet Loss (với margin) bảo toàn cấu trúc đó tốt hơn InfoNCE vốn đẩy mạnh toàn bộ negatives ra xa.
 
 ---
 
@@ -119,12 +119,13 @@ pip install transformers pytorch-metric-learning pillow tqdm matplotlib
 ```bash
 cd research
 
-# CLIP-base features (pipeline cũ)
-python scripts/extract_features.py
-
 # FashionCLIP features (lần đầu download ~600MB, khuyên dùng)
-python scripts/extract_features_fashionclip.py
+python scripts/extract_features.py --backbone fashionclip
 # Output: data/features_fashionclip/
+
+# CLIP-base features (pipeline cũ, để so sánh)
+python scripts/extract_features.py --backbone clip-base
+# Output: data/features/
 ```
 
 ### 3. Huấn Luyện

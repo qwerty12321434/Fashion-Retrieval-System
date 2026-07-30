@@ -3,6 +3,7 @@ import sys
 import io
 import json
 import argparse
+import random
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
@@ -89,8 +90,9 @@ def main():
     with open(f"checkpoints/{ckpt_name}_config.json", "w") as f:
         json.dump(config, f, indent=4)
         
-    # Cố định Seed để chia Data ổn định
+    # Cố định Seed
     torch.manual_seed(config["seed"])
+    random.seed(config["seed"])
     
     # 2. Chuẩn bị Dữ liệu
     print("\n[1/4] Đang nạp toàn bộ Dataset (11GB) vào RAM...")
