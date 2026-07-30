@@ -18,13 +18,14 @@ Mục tiêu: kết hợp *ảnh gốc* và *câu lệnh ngôn ngữ tự nhiên*
 | BaselineFusion + Triplet | 6.52% | 16.37% | `baseline_triplet_1024_best.pth` |
 
 ### Backbone: FashionCLIP (`patrickjohncyh/fashion-clip`) ⭐ Best
-| Mô hình | Recall@10 | Recall@50 | Checkpoint |
-|---------|-----------|-----------|-----------|
-| Zero-shot Vector Addition | 10.32% | 22.39% | — |
-| BaselineFusion + InfoNCE | 9.18% | 21.13% | `fashionclip_infonce_1024_best.pth` |
-| **BaselineFusion + Triplet** | **12.88%** | **26.56%** | `fashionclip_triplet_1024_best.pth` |
+| Mô hình | Kiến trúc | R@10 | R@50 | Checkpoint |
+|---------|-----------|------|------|------------|
+| Zero-shot Vector Addition | — | 10.32% | 22.39% | — |
+| BaselineFusion + InfoNCE | MLP (CLS+EOS) | 9.18% | 21.13% | `fashionclip_infonce_1024_best.pth` |
+| BaselineFusion + Triplet | MLP (CLS+EOS) | 12.88% | **26.56%** | `fashionclip_triplet_1024_best.pth` |
+| **AACLFusion + Triplet** | Additive Attention (50 patches + full text) | **12.45%** | 25.66% | `aacl_fashionclip_triplet_best.pth` |
 
-> **Key Insight:** FashionCLIP (fine-tuned trên ~700K sản phẩm thời trang) kết hợp Triplet Loss đạt hiệu năng tốt nhất. FashionCLIP tạo ra không gian embedding đã có cấu trúc tốt cho domain thời trang, nên Triplet Loss (với margin) bảo toàn cấu trúc đó tốt hơn InfoNCE vốn đẩy mạnh toàn bộ negatives ra xa.
+> **Key Insight (Phase B):** AACLFusion tái hiện đúng cơ chế AACL paper — dùng toàn bộ 50 patch token ảnh và full text sequence thay vì chỉ CLS+EOS. Kết quả tương đương BaselineFusion (R@10: 12.45% vs 12.88%), cho thấy context vector đơn lẻ `c` trong AACL chưa đủ mạnh để xử lý câu lệnh nhiều thuộc tính — đây là điểm yếu cụ thể sẽ được giải quyết ở **Phase D (AttentionFusion multi-head)**.
 
 ---
 

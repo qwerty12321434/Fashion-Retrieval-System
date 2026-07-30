@@ -12,11 +12,11 @@ import torch.nn.functional as F
 # Ép Windows Terminal dùng UTF-8 để in tiếng Việt
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-from data.dataset import FashionIQDataset, custom_collate_fn, CategoryBatchSampler
-from models.model import BaselineFusion
+from data.dataset import FashionIQDataset, custom_collate_fn, aacl_collate_fn, CategoryBatchSampler
+from models.model import BaselineFusion, AACLFusion
 from models.loss import CIRLoss, CIRTripletLoss
 
-def eval_accuracy(model, dataloader, device):
+def eval_accuracy(model, dataloader, device, arch="baseline"):
     """
     Hàm đánh giá Accuracy@1 trên Dev-Subset.
     Mô hình phải được chuyển sang model.eval() trước khi gọi.
@@ -27,43 +27,43 @@ def eval_accuracy(model, dataloader, device):
     
     with torch.no_grad():
         for batch in dataloader:
-            src_imgs, txt_feats, txt_mask, txt_lengths, tgt_imgs = batch
+            if arch == "aacl":
+                src_imgs, src_patches, txt_feats, txt_mask, txt_lengths, tgt_imgs = batch
+                src_imgs    = src_imgs.to(device)
+                src_patches = src_patches.to(device)
+                txt_feats   = txt_feats.to(device)
+                txt_mask    = txt_mask.to(device)
+                tgt_imgs    = tgt_imgs.to(device)
+                combined_query = model(src_patches, txt_feats, txt_mask)
+            else:
+                src_imgs, txt_feats, txt_mask, txt_lengths, tgt_imgs = batch
+                src_imgs_cls = src_imgs.to(device)
+                txt_feats    = txt_feats.to(device)
+                txt_lengths  = txt_lengths.to(device)
+                tgt_imgs     = tgt_imgs.to(device)
+                B            = src_imgs_cls.size(0)
+                eos_indices  = txt_lengths - 1
+                txt_eos      = txt_feats[torch.arange(B, device=device), eos_indices]
+                combined_query = model(src_imgs_cls, txt_eos)
             
-            src_imgs_cls = src_imgs.to(device)
-            txt_feats = txt_feats.to(device)
-            txt_lengths = txt_lengths.to(device)
-            tgt_imgs_cls = tgt_imgs.to(device)
-            
-            # Forward
-            # Extract txt_eos
-            B = src_imgs_cls.size(0)
-            eos_indices = txt_lengths - 1
-            txt_eos = txt_feats[torch.arange(B, device=device), eos_indices]
-            
-            combined_query = model(src_imgs_cls, txt_eos)
-            q_norm = F.normalize(combined_query, p=2, dim=-1)
-            
-            target_cls = F.normalize(tgt_imgs_cls, p=2, dim=-1)
-            
-            # Tính độ tương đồng
-            sim_matrix = q_norm @ target_cls.T
-            
-            # Lấy top-1
-            pred = sim_matrix.argmax(dim=1)
-            
-            # Đếm số lượng đoán đúng (đường chéo)
-            correct += (pred == torch.arange(len(pred), device=device)).sum().item()
-            total += len(pred)
+            q_norm      = F.normalize(combined_query, p=2, dim=-1)
+            target_cls  = F.normalize(tgt_imgs, p=2, dim=-1)
+            sim_matrix  = q_norm @ target_cls.T
+            pred        = sim_matrix.argmax(dim=1)
+            correct    += (pred == torch.arange(len(pred), device=device)).sum().item()
+            total      += len(pred)
             
     return (correct / total) * 100.0 if total > 0 else 0.0
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train BaselineFusion model")
+    parser = argparse.ArgumentParser(description="Train BaselineFusion / AACLFusion model")
     parser.add_argument("--run_name", type=str, default="baseline_all", help="Prefix for checkpoint names")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs to train")
     parser.add_argument("--loss", type=str, default="infonce", choices=["infonce", "triplet"], help="Loss function to use")
     parser.add_argument("--features_dir", type=str, default="data/features", help="Directory containing feature tensors")
+    parser.add_argument("--arch", type=str, default="baseline", choices=["baseline", "aacl"],
+                        help="Mô hình: baseline=BaselineFusion (CLS+EOS), aacl=AACLFusion (patches+full text)")
     args = parser.parse_args()
 
     print("=== BẮT ĐẦU QUÁ TRÌNH HUẤN LUYỆN (DAY 3) ===")
@@ -72,15 +72,16 @@ def main():
     
     # 1. Cấu hình (Config)
     config = {
-        "run_name": args.run_name,
-        "batch_size": 256,
-        "epochs": args.epochs,
-        "lr": 1e-4,
+        "run_name"    : args.run_name,
+        "arch"        : args.arch,
+        "batch_size"  : 256,
+        "epochs"      : args.epochs,
+        "lr"          : 1e-4,
         "weight_decay": 1e-4,
-        "temperature": 0.1,
-        "dev_size": 300,
-        "seed": 42,
-        "loss": args.loss,
+        "temperature" : 0.1,
+        "dev_size"    : 300,
+        "seed"        : 42,
+        "loss"        : args.loss,
         "features_dir": args.features_dir
     }
     
@@ -95,38 +96,35 @@ def main():
     random.seed(config["seed"])
     
     # 2. Chuẩn bị Dữ liệu
-    print("\n[1/4] Đang nạp toàn bộ Dataset (11GB) vào RAM...")
-    full_dataset = FashionIQDataset(data_dir="data", features_dir=config["features_dir"], category="all")
+    use_patches = (config["arch"] == "aacl")
+    print(f"\n[1/4] Đang nạp Dataset (arch={config['arch']}, use_patches={use_patches})...")
+    full_dataset = FashionIQDataset(
+        data_dir="data",
+        features_dir=config["features_dir"],
+        category="all",
+        use_patches=use_patches
+    )
     
     train_size = len(full_dataset) - config["dev_size"]
     train_subset, dev_subset = random_split(full_dataset, [train_size, config["dev_size"]])
     
     print(f"Tổng mẫu: {len(full_dataset)} | Train: {len(train_subset)} | Dev: {len(dev_subset)}")
     
+    collate_fn = aacl_collate_fn if use_patches else custom_collate_fn
+    
     train_sampler = CategoryBatchSampler(train_subset, config["batch_size"], drop_last=True)
-    
-    train_loader = DataLoader(
-        train_subset, 
-        batch_sampler=train_sampler, 
-        collate_fn=custom_collate_fn
-    )
-    
-    dev_loader = DataLoader(
-        dev_subset, 
-        batch_size=config["batch_size"], 
-        shuffle=False, 
-        drop_last=False, 
-        collate_fn=custom_collate_fn
-    )
+    train_loader  = DataLoader(train_subset, batch_sampler=train_sampler, collate_fn=collate_fn)
+    dev_loader    = DataLoader(dev_subset, batch_size=config["batch_size"],
+                               shuffle=False, drop_last=False, collate_fn=collate_fn)
     
     # 3. Khởi tạo Mô hình & Tối ưu hóa
-    print("\n[2/4] Khởi tạo Mô hình BaselineFusion...")
-    model = BaselineFusion(
-        img_dim=768, 
-        txt_dim=512, 
-        hidden_dim=1024, 
-        out_dim=768
-    ).to(device)
+    print(f"\n[2/4] Khởi tạo mô hình [{config['arch'].upper()}]...")
+    if config["arch"] == "aacl":
+        model = AACLFusion(img_dim=768, txt_dim=512, hidden_dim=768).to(device)
+        print("   Kiến trúc: AACLFusion (50 patch tokens + full text sequence)")
+    else:
+        model = BaselineFusion(img_dim=768, txt_dim=512, hidden_dim=1024, out_dim=768).to(device)
+        print("   Kiến trúc: BaselineFusion (CLS token + EOS token, MLP)")
     if config["loss"] == "triplet":
         criterion = CIRTripletLoss(margin=0.2).to(device)
         print(f"   Hàm Loss: TripletMarginLoss (margin=0.2)")
@@ -147,22 +145,30 @@ def main():
         total_loss = 0.0
         
         for batch in train_loader:
-            src_imgs, txt_feats, txt_mask, txt_lengths, tgt_imgs = batch
-            
-            src_imgs_cls = src_imgs.to(device)
-            txt_feats = txt_feats.to(device)
-            txt_lengths = txt_lengths.to(device)
-            tgt_imgs_cls = tgt_imgs.to(device)
+            if use_patches:
+                src_imgs, src_patches, txt_feats, txt_mask, txt_lengths, tgt_imgs = batch
+                src_imgs    = src_imgs.to(device)
+                src_patches = src_patches.to(device)
+                txt_feats   = txt_feats.to(device)
+                txt_mask    = txt_mask.to(device)
+                tgt_imgs    = tgt_imgs.to(device)
+            else:
+                src_imgs, txt_feats, txt_mask, txt_lengths, tgt_imgs = batch
+                src_imgs   = src_imgs.to(device)
+                txt_feats  = txt_feats.to(device)
+                txt_lengths= txt_lengths.to(device)
+                tgt_imgs   = tgt_imgs.to(device)
             
             optimizer.zero_grad()
             
-            # Extract txt_eos
-            B = src_imgs_cls.size(0)
-            eos_indices = txt_lengths - 1
-            txt_eos = txt_feats[torch.arange(B, device=device), eos_indices]
-            
-            combined_query = model(src_imgs_cls, txt_eos)
-            loss = criterion(combined_query, tgt_imgs_cls)
+            if use_patches:
+                combined_query = model(src_patches, txt_feats, txt_mask)
+            else:
+                B           = src_imgs.size(0)
+                eos_indices = txt_lengths - 1
+                txt_eos     = txt_feats[torch.arange(B, device=device), eos_indices]
+                combined_query = model(src_imgs, txt_eos)
+            loss = criterion(combined_query, tgt_imgs)
             
             loss.backward()
             optimizer.step()
@@ -175,7 +181,7 @@ def main():
         scheduler.step()
         
         # --- EVAL PHASE (Dev Subset) ---
-        dev_acc = eval_accuracy(model, dev_loader, device)
+        dev_acc = eval_accuracy(model, dev_loader, device, arch=config["arch"])
         
         print(f"Epoch [{epoch:02d}/{config['epochs']}] | Train Loss: {avg_train_loss:.4f} | Dev Acc@1: {dev_acc:.2f}% | LR: {scheduler.get_last_lr()[0]:.6f}")
         

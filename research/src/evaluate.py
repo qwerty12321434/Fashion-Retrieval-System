@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 from data.dataset import FashionIQDataset, custom_collate_fn
-from models.model import BaselineFusion
+from models.model import BaselineFusion, AACLFusion
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
@@ -19,6 +19,8 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate BaselineFusion model")
     parser.add_argument("--ckpt", type=str, nargs='+', required=True, help="One or more checkpoints to evaluate (e.g., fashionclip_triplet_1024_best.pth)")
     parser.add_argument("--features_dir", type=str, default="data/features", help="Thư mục chứa feature .pt files (dùng data/features_fashionclip cho FashionCLIP)")
+    parser.add_argument("--arch", type=str, default="baseline", choices=["baseline", "aacl"],
+                        help="Kiến trúc mô hình: baseline=BaselineFusion, aacl=AACLFusion")
     args = parser.parse_args()
 
     print("=== ĐÁNH GIÁ MÔ HÌNH (DAY 5) ===")
@@ -71,12 +73,27 @@ def main():
     recalls_10 = []
     recalls_50 = []
     
+    # Load candidate patch tokens nếu cần (AACL mode)
+    candidate_patch_tokens = None
+    if args.arch == "aacl":
+        patch_path = os.path.join(features_dir, "candidate_patch_tokens.pt")
+        if not os.path.exists(patch_path):
+            print(f"[LỖI] Không tìm thấy {patch_path}.")
+            print("  Chạy trước: python scripts/prep_candidate_patches.py")
+            return
+        print(f"  Nạp candidate patch tokens từ {patch_path}...")
+        candidate_patch_tokens = torch.load(patch_path, map_location=device, weights_only=True)
+        print(f"  Đã nạp {len(candidate_patch_tokens)} ASIN patch tokens.")
+
     for ckpt_file in args.ckpt:
-        print(f"   Khởi tạo BaselineFusion từ {ckpt_file}...")
+        print(f"   Khởi tạo mô hình [{args.arch.upper()}] từ {ckpt_file}...")
         state_dict = torch.load(f"checkpoints/{ckpt_file}", map_location=device, weights_only=True)
-        detected_hidden_dim = state_dict['mlp.0.weight'].shape[0] if 'mlp.0.weight' in state_dict else 1024
         
-        model = BaselineFusion(hidden_dim=detected_hidden_dim).to(device)
+        if args.arch == "aacl":
+            model = AACLFusion(img_dim=768, txt_dim=512, hidden_dim=768).to(device)
+        else:
+            detected_hidden_dim = state_dict['mlp.0.weight'].shape[0] if 'mlp.0.weight' in state_dict else 1024
+            model = BaselineFusion(hidden_dim=detected_hidden_dim).to(device)
         model.load_state_dict(state_dict)
         model.eval()
         models.append(model)
@@ -117,18 +134,28 @@ def main():
             if zs_rank <= 10: recall_10_zs += 1
             if zs_rank <= 50: recall_50_zs += 1
             
-            # --- ĐỐI THỦ 2+: BASELINE FUSION (tất cả checkpoints) ---
-            c_cls = gallery_cls_768[candidate_idx].unsqueeze(0) # [1, 768]
-            t_hidden = val_hidden_all[i].unsqueeze(0) # [1, seq_len, 512]
-            t_eos = t_hidden[:, -1, :] # [1, 512] - Vị trí -1 luôn là EOS vì dữ liệu được trích xuất từng câu đơn lẻ (không padding)
+            # --- ĐỐI THỦ 2+: FUSION MODEL (tất cả checkpoints) ---
+            c_cls    = gallery_cls_768[candidate_idx].unsqueeze(0)  # [1, 768]
+            t_hidden = val_hidden_all[i].unsqueeze(0)               # [1, seq_len, 512]
             
             for m_idx, model in enumerate(models):
-                bf_query = model(c_cls, t_eos)
-                bf_query_norm = F.normalize(bf_query, p=2, dim=-1)
+                if args.arch == "aacl" and candidate_patch_tokens is not None:
+                    # AACL: dùng patch tokens + full text sequence
+                    patches = candidate_patch_tokens.get(
+                        candidate_asin, torch.zeros(50, 768, device=device)
+                    ).unsqueeze(0).to(device)   # [1, 50, 768]
+                    # tạo mask (toàn bộ real vì val text không có padding trong trường hợp 1 mẫu)
+                    t_mask = torch.ones(1, t_hidden.size(1), device=device, dtype=torch.bool)
+                    fusion_query = model(patches, t_hidden, t_mask)
+                else:
+                    # Baseline: CLS + EOS
+                    t_eos        = t_hidden[:, -1, :]               # [1, 512]
+                    fusion_query = model(c_cls, t_eos)
                 
-                bf_sims = (bf_query_norm @ gallery_cls_norm.T).squeeze(0)
-                bf_target_score = bf_sims[target_idx].item()
-                bf_rank = get_rank(bf_sims, bf_target_score)
+                bf_query_norm  = F.normalize(fusion_query, p=2, dim=-1)
+                bf_sims        = (bf_query_norm @ gallery_cls_norm.T).squeeze(0)
+                bf_target_score= bf_sims[target_idx].item()
+                bf_rank        = get_rank(bf_sims, bf_target_score)
                 if bf_rank <= 10: recalls_10[m_idx] += 1
                 if bf_rank <= 50: recalls_50[m_idx] += 1
             
@@ -144,7 +171,8 @@ def main():
     print(f" - Recall@50: {recall_50_zs / valid_queries * 100:.2f}%")
     
     for m_idx, name in enumerate(model_names):
-        print(f"\n{m_idx + 2}. BASELINE FUSION ({name})")
+        label = "AACL FUSION" if args.arch == "aacl" else "BASELINE FUSION"
+        print(f"\n{m_idx + 2}. {label} ({name})")
         print(f" - Recall@10: {recalls_10[m_idx] / valid_queries * 100:.2f}%")
         print(f" - Recall@50: {recalls_50[m_idx] / valid_queries * 100:.2f}%")
 

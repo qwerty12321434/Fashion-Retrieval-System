@@ -6,14 +6,18 @@ from torch.utils.data import Dataset, Sampler
 from torch.nn.utils.rnn import pad_sequence
 
 class FashionIQDataset(Dataset):
-    def __init__(self, data_dir="data", features_dir="data/features", category="dress"):
+    def __init__(self, data_dir="data", features_dir="data/features", category="dress", use_patches=False):
         """
         Khởi tạo Dataset. 
         Sẽ nạp toàn bộ đặc trưng ảnh (228MB cho CLS token) và đặc trưng chữ vào RAM để tăng tốc.
+        Args:
+            use_patches: Nếu True, load thêm candidate_patch_tokens.pt ([50, 768] cho mỗi ASIN).
+                         Cần chạy scripts/prep_candidate_patches.py trước.
         """
-        self.data_dir = data_dir
+        self.data_dir     = data_dir
         self.features_dir = features_dir
-        self.category = category
+        self.category     = category
+        self.use_patches  = use_patches
         
         # 1. Đọc file JSON và Text features
         self.data = []
@@ -56,24 +60,44 @@ class FashionIQDataset(Dataset):
         self.asin_to_idx = {asin: idx for idx, asin in enumerate(self.gallery_asins)}
         
         print(f"Total pairs loaded: {len(self.data)}")
+        
+        # 3. (Optional) Load patch tokens cho candidate images (AACL mode)
+        self.patch_features = None
+        if use_patches:
+            patch_path = os.path.join(features_dir, "candidate_patch_tokens.pt")
+            if not os.path.exists(patch_path):
+                raise FileNotFoundError(
+                    f"[AACL] Không tìm thấy {patch_path}.\n"
+                    "Hãy chạy trước: python scripts/prep_candidate_patches.py"
+                )
+            print(f"Loading candidate patch tokens (AACL) from {patch_path}...")
+            self.patch_features = torch.load(patch_path, map_location="cpu", weights_only=True)
+            print(f"  Loaded patch tokens for {len(self.patch_features)} candidate ASINs.")
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        item = self.data[idx]
+        item         = self.data[idx]
         candidate_id = item['candidate']
-        target_id = item['target']
+        target_id    = item['target']
         
         # Lấy đặc trưng (shape: [768] cho ảnh, [seq_len, 512] cho text)
         src_idx = self.asin_to_idx[candidate_id]
         tgt_idx = self.asin_to_idx[target_id]
         
-        src_img_feat = self.image_features[src_idx]
-        tgt_img_feat = self.image_features[tgt_idx]
-        txt_feat = self.text_features[idx] # Dictionary lưu theo số thứ tự
+        src_img_feat = self.image_features[src_idx]   # [768] CLS
+        tgt_img_feat = self.image_features[tgt_idx]   # [768] CLS
+        txt_feat     = self.text_features[idx]         # [seq_len, 512] full sequence
         
-        return src_img_feat, txt_feat, tgt_img_feat
+        if self.use_patches:
+            # [50, 768] — patch tokens của candidate image
+            src_patch = self.patch_features.get(
+                candidate_id, torch.zeros(50, self.image_features.shape[-1])
+            )
+            return src_img_feat, src_patch, txt_feat, tgt_img_feat
+        else:
+            return src_img_feat, txt_feat, tgt_img_feat
 
 def custom_collate_fn(batch):
     """
@@ -163,3 +187,40 @@ class CategoryBatchSampler(Sampler):
             else:
                 length += (len(indices) + self.batch_size - 1) // self.batch_size
         return length
+
+
+def aacl_collate_fn(batch):
+    """
+    Collate function cho AACL mode (use_patches=True).
+    Mỗi sample trả về: (src_img_feat, src_patch, txt_feat, tgt_img_feat)
+    
+    Returns:
+        src_imgs_batched : [B, 768]           — CLS token candidate (giữ để eval baseline song song)
+        src_patches      : [B, 50, 768]       — patch tokens candidate
+        txt_feats_padded : [B, max_L, 512]    — full text sequence (đã pad)
+        txt_mask         : [B, max_L] bool    — True = real token
+        txt_lengths      : [B]                — độ dài thật sự
+        tgt_imgs_batched : [B, 768]           — CLS token target
+    """
+    src_imgs  = []
+    src_pats  = []
+    txt_feats = []
+    tgt_imgs  = []
+
+    for src, patch, txt, tgt in batch:
+        src_imgs.append(src)
+        src_pats.append(patch)
+        txt_feats.append(txt)
+        tgt_imgs.append(tgt)
+
+    src_imgs_batched = torch.stack(src_imgs)   # [B, 768]
+    src_patches      = torch.stack(src_pats)   # [B, 50, 768]
+    tgt_imgs_batched = torch.stack(tgt_imgs)   # [B, 768]
+
+    txt_feats_padded = pad_sequence(txt_feats, batch_first=True, padding_value=0.0)  # [B, max_L, 512]
+    text_lengths     = torch.tensor([t.size(0) for t in txt_feats], dtype=torch.long)
+    max_len          = txt_feats_padded.size(1)
+    batch_size       = len(batch)
+    txt_mask         = torch.arange(max_len).expand(batch_size, max_len) < text_lengths.unsqueeze(1)
+
+    return src_imgs_batched, src_patches, txt_feats_padded, txt_mask, text_lengths, tgt_imgs_batched
