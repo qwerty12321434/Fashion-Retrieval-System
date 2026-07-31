@@ -5,13 +5,38 @@ import torch
 from torch.utils.data import Dataset, Sampler
 from torch.nn.utils.rnn import pad_sequence
 
+
+def validate_patch_features(patch_features, required_candidates, expected_shape, context):
+    """Dừng sớm nếu artifact visual tokens thiếu candidate hoặc sai shape."""
+    required = set(required_candidates)
+    missing = sorted(required - set(patch_features))
+    if missing:
+        raise RuntimeError(
+            f"[AACL] Thiếu patch token cho {len(missing)} {context} candidate. "
+            f"Ví dụ: {missing[:5]}. Hãy chạy lại scripts/prep_candidate_patches.py."
+        )
+
+    invalid = [
+        (asin, tuple(patch_features[asin].shape))
+        for asin in required
+        if tuple(patch_features[asin].shape) != expected_shape
+    ]
+    if invalid:
+        raise RuntimeError(
+            f"[AACL] Có {len(invalid)} {context} patch tensor sai shape; "
+            f"yêu cầu {expected_shape}. Ví dụ: {invalid[:5]}"
+        )
+    print(f"  Patch coverage OK: {len(required)} candidates, shape={expected_shape}.")
+
+
 class FashionIQDataset(Dataset):
     def __init__(self, data_dir="data", features_dir="data/features", category="dress", use_patches=False):
         """
         Khởi tạo Dataset. 
         Sẽ nạp toàn bộ đặc trưng ảnh (228MB cho CLS token) và đặc trưng chữ vào RAM để tăng tốc.
         Args:
-            use_patches: Nếu True, load thêm candidate_patch_tokens.pt ([50, 768] cho mỗi ASIN).
+            use_patches: Nếu True, load thêm candidate_patch_tokens.pt
+                         ([50, 768] visual tokens = 1 CLS + 49 spatial patches).
                          Cần chạy scripts/prep_candidate_patches.py trước.
         """
         self.data_dir     = data_dir
@@ -78,6 +103,13 @@ class FashionIQDataset(Dataset):
             )
             print(f"  Loaded patch tokens for {len(self.patch_features)} candidate ASINs.")
 
+            validate_patch_features(
+                self.patch_features,
+                (item["candidate"] for item in self.data),
+                expected_shape=(50, self.image_features.shape[-1]),
+                context="train",
+            )
+
     def __len__(self):
         return len(self.data)
 
@@ -95,10 +127,9 @@ class FashionIQDataset(Dataset):
         txt_feat     = self.text_features[idx]         # [seq_len, 512] full sequence
         
         if self.use_patches:
-            # [50, 768] — patch tokens của candidate image
-            src_patch = self.patch_features.get(
-                candidate_id, torch.zeros(50, self.image_features.shape[-1])
-            )
+            # [50, 768] — 1 CLS + 49 spatial patch tokens của candidate image.
+            # Coverage đã được kiểm tra fail-fast trong __init__.
+            src_patch = self.patch_features[candidate_id]
             return src_img_feat, src_patch, txt_feat, tgt_img_feat
         else:
             return src_img_feat, txt_feat, tgt_img_feat
@@ -200,7 +231,7 @@ def aacl_collate_fn(batch):
     
     Returns:
         src_imgs_batched : [B, 768]           — CLS token candidate (giữ để eval baseline song song)
-        src_patches      : [B, 50, 768]       — patch tokens candidate
+        src_patches      : [B, 50, 768]       — 50 visual tokens candidate
         txt_feats_padded : [B, max_L, 512]    — full text sequence (đã pad)
         txt_mask         : [B, max_L] bool    — True = real token
         txt_lengths      : [B]                — độ dài thật sự

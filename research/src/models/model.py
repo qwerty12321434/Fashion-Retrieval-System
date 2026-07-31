@@ -62,7 +62,8 @@ class AACLFusion(nn.Module):
 
     Thay vì chỉ dùng CLS token và EOS vector (như BaselineFusion),
     AACLFusion nhận TOÀN BỘ:
-      - 50 patch tokens của ảnh candidate [B, 50, 768]
+      - 50 visual tokens của ảnh candidate [B, 50, 768]
+        (1 CLS token + 49 spatial patch tokens)
       - L token của câu lệnh text [B, L, 512]
 
     5 bước theo đúng AACL paper:
@@ -87,7 +88,7 @@ class AACLFusion(nn.Module):
 
     def forward(self, img_patches, txt_tokens, txt_mask):
         """
-        img_patches : [B, 50, 768]   — patch tokens của candidate image
+        img_patches : [B, 50, 768]   — 1 CLS + 49 spatial patch tokens
         txt_tokens  : [B, L,  512]   — full token sequence của text query (đã pad)
         txt_mask    : [B, L]  bool   — True = real token, False = padding
         Returns     : [B, 768]       — composed query vector
@@ -100,7 +101,7 @@ class AACLFusion(nn.Module):
         # Bước 1: Concat patch + text token
         H = torch.cat([H_img, H_txt], dim=1)    # [B, 50+L, H]
 
-        # Mask: tất cả 50 patch token đều real, text dùng txt_mask
+        # Mask: tất cả 50 visual token đều real, text dùng txt_mask
         img_mask  = torch.ones(B, img_patches.size(1),
                                device=H.device, dtype=torch.bool)   # [B, 50]
         full_mask = torch.cat([img_mask, txt_mask], dim=1)          # [B, 50+L]

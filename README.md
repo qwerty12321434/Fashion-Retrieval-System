@@ -8,27 +8,52 @@ Mục tiêu: kết hợp *ảnh gốc* và *câu lệnh ngôn ngữ tự nhiên*
 
 ---
 
-## 📊 Kết Quả Thực Nghiệm (FashionIQ Validation — 6016 queries)
+## 📊 Kết Quả Thực Nghiệm (FashionIQ Validation — 6.016 queries)
 
-### Backbone: CLIP-base (`openai/clip-vit-base-patch32`)
-| Mô hình | Recall@10 | Recall@50 | Checkpoint |
-|---------|-----------|-----------|-----------|
-| Zero-shot Vector Addition | 5.82% | 13.61% | — |
-| BaselineFusion + InfoNCE | 6.78% | 17.07% | `baseline_infonce_1024_best.pth` |
-| BaselineFusion + Triplet | 6.52% | 16.37% | `baseline_triplet_1024_best.pth` |
+Kết quả được tách thành hai protocol, không so sánh trực tiếp điểm giữa hai bảng:
 
-### Backbone: FashionCLIP (`patrickjohncyh/fashion-clip`) ⭐ Best
-| Mô hình | Kiến trúc | R@10 | R@50 | Checkpoint |
-|---------|-----------|------|------|------------|
-| Zero-shot Vector Addition | — | 10.32% | 22.39% | — |
-| BaselineFusion + InfoNCE | MLP (CLS+EOS) | 9.18% | 21.14% | `fashionclip_infonce_1024_best.pth` |
-| BaselineFusion + Triplet | MLP (CLS+EOS) | 12.88% | 26.56% | `fashionclip_triplet_1024_best.pth` |
-| BaselineFusion + Batch Classification | MLP (CLS+EOS) | 11.88% | 27.11% | `fashionclip_batchcls_1024_best.pth` |
-| AACLFusion + Triplet | Additive Attention (50 patches + full text) | 12.45% | 25.66% | `aacl_fashionclip_triplet_best.pth` |
-| AACLFusion + Batch Classification | Additive Attention (50 tokens + full text) | 12.53% | 26.88% | `aacl_fashionclip_batchcls_best.pth` |
-| **AACLFusion + InfoNCE** | Additive Attention (50 patches + full text) | **13.76%** | **27.78%** | `aacl_fashionclip_infonce_best.pth` |
+- **FashionIQ Standard:** đánh giá riêng từng category trên đúng validation split; số cuối là macro-average của dress, shirt và toptee.
+- **Global-74K:** tất cả query tìm trên toàn bộ 74.381 ảnh local; số cuối là pooled recall trên 6.016 query.
 
-> **Key Insight (Phase B):** Biến thể AACL-inspired single-head với InfoNCE vẫn cho kết quả cao nhất (**R@10: 13.76%, R@50: 27.78%**). Batch Classification một chiều theo công thức AACL paper cải thiện BaselineFusion so với InfoNCE và đạt R@50 cao nhất trong ba loss của Baseline, nhưng chưa vượt Triplet ở R@10 và chưa vượt InfoNCE trên AACLFusion. Điều này cho thấy loss gốc của paper không tự động chuyển thành loss tốt nhất khi dùng frozen FashionCLIP và kiến trúc AACL rút gọn.
+### FashionIQ Standard — FashionCLIP
+
+| Mô hình | Dress R@10/R@50 | Shirt R@10/R@50 | Toptee R@10/R@50 | Macro Avg R@10/R@50 |
+|---------|------------------|------------------|-------------------|----------------------|
+| Zero-shot Vector Addition | 20.48 / 40.11 | 21.30 / 37.00 | 25.40 / 44.26 | 22.39 / 40.46 |
+| BaselineFusion + legacy NT-Xent | 24.64 / 46.06 | 15.90 / 33.42 | 27.08 / 45.95 | 22.54 / 41.81 |
+| BaselineFusion + Triplet | 30.04 / 52.70 | 21.69 / 40.87 | 32.23 / 53.03 | 27.99 / 48.87 |
+| **BaselineFusion + Batch Classification** | **33.56 / 58.45** | **26.55 / 50.00** | 36.72 / **64.05** | **32.28 / 57.50** |
+| AACLFusion + legacy NT-Xent | 32.57 / 54.44 | 22.42 / 41.90 | 33.30 / 55.38 | 29.43 / 50.57 |
+| AACLFusion + Triplet | 31.09 / 54.09 | 20.31 / 40.63 | 31.87 / 53.80 | 27.76 / 49.51 |
+| AACLFusion + Batch Classification | 33.42 / 56.97 | 25.32 / 49.75 | **37.68** / 62.72 | 32.14 / 56.48 |
+
+Gallery chuẩn lấy trực tiếp từ metadata chính thức: dress 3.817 ảnh, shirt 6.346 ảnh và toptee 5.373 ảnh. File toptee chính thức hiện có 5.373 ASIN, lệch một ảnh so với con số 5.374 trong supplementary.
+
+### Global-74K — FashionCLIP
+
+| Mô hình | Pooled R@10 | Pooled R@50 |
+|---------|-------------|-------------|
+| Zero-shot Vector Addition | 10.44% | 22.44% |
+| BaselineFusion + legacy NT-Xent | 9.41% | 21.23% |
+| BaselineFusion + Triplet | 13.08% | 26.65% |
+| BaselineFusion + Batch Classification | 12.07% | 27.16% |
+| AACLFusion + Triplet | 12.67% | 25.75% |
+| AACLFusion + Batch Classification | 12.77% | 26.93% |
+| **AACLFusion + legacy NT-Xent** | **13.93%** | **27.88%** |
+
+> **Key Insight:** Kết luận phụ thuộc protocol. Batch Classification tốt nhất trên FashionIQ Standard, trong đó BaselineFusion đạt macro R@10/R@50 = **32.28/57.50**. Ngược lại, AACLFusion + legacy NT-Xent tốt nhất trên Global-74K với pooled R@10/R@50 = **13.93/27.88**. Vì vậy, Global-74K được xem là thí nghiệm catalog bổ sung và không dùng để so trực tiếp với kết quả paper.
+
+> **Rank policy:** Rank một-based được tính bằng `1 + count(similarity > target_similarity)`, tương đương chính sách strict-distance của evaluator tham chiếu. Exact-score ties đã được audit trên toàn bộ checkpoint trước khi đóng băng bảng.
+
+### CLIP-base — Global-74K (thử nghiệm backbone ban đầu)
+
+| Mô hình | Recall@10 | Recall@50 |
+|---------|-----------|-----------|
+| Zero-shot Vector Addition | 5.82% | 13.61% |
+| BaselineFusion + InfoNCE | 6.78% | 17.07% |
+| BaselineFusion + Triplet | 6.52% | 16.37% |
+
+> **Giới hạn thống kê:** Mỗi cấu hình trong bảng hiện mới được chạy với một seed (`42`). Các chênh lệch hiện tại là kết quả thực nghiệm ban đầu, chưa phải kết luận về độ ổn định qua nhiều seed.
 
 ---
 
@@ -91,13 +116,15 @@ Query [768]  ──[Cosine Similarity]──> Gallery [74381, 768] ──> Top-K
 | Triplet | `CIRTripletLoss` | Chỉ phạt negative quá gần positive — tốt hơn khi không gian đã có cấu trúc (FashionCLIP) |
 | Batch Classification | `CIRBatchClassificationLoss` | Loss một chiều query→target theo AACL paper; softmax trên toàn bộ target trong batch |
 
+InfoNCE và Triplet hiện ghép query với target vào cùng metric-learning objective, trong khi Batch Classification paper-faithful chỉ tối ưu chiều query→target. Vì vậy đây là ba chiến lược tối ưu khác nhau trên cùng protocol CIR, không phải ba objective hoàn toàn tương đương.
+
 ---
 
 ## 🚀 Hướng Dẫn Cài Đặt & Chạy
 
 ### 0. Yêu Cầu Hệ Thống
 - GPU NVIDIA với CUDA 12.1+
-- RAM ≥ 16GB (gallery features chiếm ~1.1GB VRAM + ~11GB RAM khi train patch tokens)
+- RAM ≥ 16GB (`candidate_patch_tokens.pt` hiện khoảng 2,41 GiB trên disk; khi load/train còn có tensor và DataLoader overhead)
 
 ### 1. Cài Đặt Môi Trường
 
@@ -132,8 +159,9 @@ python scripts/extract_features.py --backbone fashionclip
 python scripts/extract_features.py --backbone clip-base
 # Output: data/features/
 
-# (Chỉ cần 1 lần) Lọc patch tokens cho AACL — bắt buộc trước khi train --arch aacl
-# Input: all_image_tokens.pt (~11GB) | Output dự kiến sau clone: candidate_patch_tokens.pt (~2.5GB)
+# (Chỉ cần 1 lần) Lọc visual tokens cho AACL — bắt buộc trước khi train --arch aacl
+# Input: all_image_tokens.pt (~11GB) | Output đã lọc: candidate_patch_tokens.pt (~2.41GiB)
+# Mỗi ảnh có 50 visual tokens: 1 CLS + 49 spatial patches.
 python scripts/prep_candidate_patches.py
 ```
 
@@ -155,46 +183,64 @@ python src/train.py --run_name fashionclip_batchcls_1024 --loss batch_cls --feat
 python src/train.py --arch aacl --run_name aacl_fashionclip_infonce --loss infonce --features_dir data/features_fashionclip --epochs 50
 python src/train.py --arch aacl --run_name aacl_fashionclip_triplet --loss triplet --features_dir data/features_fashionclip --epochs 50
 python src/train.py --arch aacl --run_name aacl_fashionclip_batchcls --loss batch_cls --features_dir data/features_fashionclip --epochs 50
+
+# Seed của model/batch shuffle tách khỏi seed chia dev; dev mặc định cân bằng 100 mẫu/category.
+python src/train.py --arch aacl --loss infonce --seed 7 --split_seed 42 --dev_per_category 100
 ```
 
 Checkpoint tốt nhất tự động lưu tại `checkpoints/{run_name}_best.pth`.
 
 ### 4. Đánh Giá
 
+`evaluate.py` mặc định dùng protocol `fashioniq`. Dùng `--protocol global` khi cần tái hiện bảng Global-74K. Có thể thêm `--output_json` để lưu metric có cấu trúc trong `reports/`.
+
 ```bash
 cd research
 
-# === BaselineFusion (MLP: CLS + EOS) ===
+# === FashionIQ Standard: BaselineFusion (MLP: CLS + EOS) ===
 python src/evaluate.py \
+  --protocol fashioniq \
   --ckpt fashionclip_infonce_1024_best.pth fashionclip_triplet_1024_best.pth fashionclip_batchcls_1024_best.pth \
-  --features_dir data/features_fashionclip
+  --features_dir data/features_fashionclip \
+  --output_json reports/eval_baseline_fashioniq.json
 
-# === AACLFusion (Additive Attention: 50 patches + full text) ===
+# === FashionIQ Standard: AACLFusion ===
 python src/evaluate.py --arch aacl \
+  --protocol fashioniq \
   --ckpt aacl_fashionclip_infonce_best.pth aacl_fashionclip_triplet_best.pth aacl_fashionclip_batchcls_best.pth \
-  --features_dir data/features_fashionclip
+  --features_dir data/features_fashionclip \
+  --output_json reports/eval_aacl_fashioniq.json
+
+# === Global-74K: thêm --protocol global ===
+python src/evaluate.py --arch aacl \
+  --protocol global \
+  --ckpt aacl_fashionclip_infonce_best.pth \
+  --features_dir data/features_fashionclip \
+  --output_json reports/eval_aacl_global.json
 ```
 
 ### 5. Demo Trực Quan
 
-`demo.py` hỗ trợ hai chế độ:
+`demo.py` hỗ trợ hai chế độ query và hai phạm vi gallery:
 
-- **Validation offline:** tự lấy candidate, modifier và target thật từ FashionIQ; không cần tải backbone. Ảnh output hiển thị full-gallery rank và viền xanh target.
+- **Validation offline:** tự lấy candidate, modifier và target thật từ FashionIQ; không cần tải backbone.
 - **Free-form:** nhập ASIN và modifier tùy ý; cần backbone Hugging Face đã cache hoặc có kết nối mạng.
+- **`--gallery_scope global` (mặc định):** tìm trên toàn bộ 74.381 ảnh.
+- **`--gallery_scope category`:** tìm trên đúng validation split của category; chỉ dùng cùng `--val_index`.
 
 ```bash
 cd research
 
-# === Validation offline: Baseline + Batch Classification ===
+# === Validation offline: FashionIQ category gallery ===
 python src/demo.py \
-  --category dress --val_index 1 \
+  --category dress --gallery_scope category --val_index 1 \
   --ckpt fashionclip_batchcls_1024_best.pth \
   --arch baseline --top_k 5 \
   --output demo_baseline_batchcls.png
 
-# === Validation offline: AACL-inspired + Batch Classification ===
+# === Validation offline: Global-74K gallery ===
 python src/demo.py \
-  --category dress --val_index 1 \
+  --category dress --gallery_scope global --val_index 1 \
   --ckpt aacl_fashionclip_batchcls_best.pth \
   --arch aacl --top_k 5 \
   --output demo_aacl_batchcls.png
@@ -235,6 +281,6 @@ python src/demo.py --arch aacl \
 |-----|-----------|-----------|
 | 0 | Fix tên checkpoint động (`--run_name`) | ✅ Hoàn thành |
 | 1 | Triplet Loss + arg `--loss` | ✅ Hoàn thành |
-| 2 | AttentionFusion (50 patch tokens) | 🔄 Đang lên kế hoạch |
+| 2 | AttentionFusion (50 visual tokens: 1 CLS + 49 patches) | 🔄 Đang lên kế hoạch |
 | 3 | Attribute Classifier + Rerank | ⬜ Chưa bắt đầu |
 | 4 | FashionCLIP backbone (`--backbone`, `--features_dir`) | ✅ Hoàn thành |

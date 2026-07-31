@@ -40,7 +40,9 @@ def load_font(size, bold=False):
 def target_rank(similarities, target_idx):
     if target_idx is None:
         return None
-    return int((similarities >= similarities[target_idx]).sum().item())
+    return 1 + int(
+        (similarities > similarities[target_idx]).sum().item()
+    )
 
 
 def load_fusion_model(arch, checkpoint_path, device):
@@ -244,7 +246,10 @@ def draw_demo(args, query, zero_results, fusion_results, zero_rank, fusion_rank)
     )
     draw.text(
         (18, 119),
-        f"Checkpoint: {args.ckpt}  |  Gallery: {len(args.gallery_asins):,} ảnh",
+        (
+            f"Checkpoint: {args.ckpt}  |  "
+            f"Gallery: {args.gallery_label} ({len(args.gallery_asins):,} ảnh)"
+        ),
         fill="#6B7280",
         font=small_font,
     )
@@ -363,6 +368,20 @@ def parse_args():
         help="Category dùng cùng --val_index",
     )
     parser.add_argument(
+        "--gallery_scope",
+        default="global",
+        choices=["global", "category"],
+        help=(
+            "global: tìm trên 74K ảnh; category: tìm trên split val "
+            "của --category (chỉ dùng với --val_index)"
+        ),
+    )
+    parser.add_argument(
+        "--splits_dir",
+        default="data/json",
+        help="Thư mục chứa split.{category}.val.json",
+    )
+    parser.add_argument(
         "--top_k",
         type=int,
         default=5,
@@ -409,6 +428,8 @@ def parse_args():
         parser.error("--top_k phải nằm trong [1, 10]")
     if args.val_index is None and (not args.candidate or not args.text):
         parser.error("Cần --candidate và --text, hoặc dùng --val_index")
+    if args.gallery_scope == "category" and args.val_index is None:
+        parser.error("--gallery_scope category chỉ dùng cùng --val_index")
     return args
 
 
@@ -436,8 +457,7 @@ def main():
     )
     with open(feature_dir / "gallery_asins.json", encoding="utf-8") as handle:
         gallery_asins = json.load(handle)
-    args.gallery_asins = gallery_asins
-    asin_to_idx = {asin: idx for idx, asin in enumerate(gallery_asins)}
+    global_gallery_asins = gallery_asins
 
     fusion_model = load_fusion_model(
         args.arch,
@@ -450,13 +470,59 @@ def main():
         )
         query = load_validation_query(
             args,
-            gallery_asins,
+            global_gallery_asins,
             gallery_cls,
             gallery_embeds,
             device,
         )
     else:
         query = load_free_form_query(args, device)
+
+    if args.gallery_scope == "category":
+        split_path = (
+            Path(args.splits_dir) / f"split.{args.category}.val.json"
+        )
+        if not split_path.exists():
+            raise FileNotFoundError(
+                f"Không tìm thấy FashionIQ split: {split_path}"
+            )
+        with open(split_path, encoding="utf-8") as handle:
+            split_asins = json.load(handle)
+        if len(split_asins) != len(set(split_asins)):
+            raise ValueError(f"{split_path} chứa ASIN trùng lặp")
+
+        global_asin_to_idx = {
+            asin: index
+            for index, asin in enumerate(global_gallery_asins)
+        }
+        missing = [
+            asin for asin in split_asins if asin not in global_asin_to_idx
+        ]
+        if missing:
+            raise ValueError(
+                f"{split_path}: thiếu {len(missing)} ảnh trong gallery local"
+            )
+        gallery_indices = torch.tensor(
+            [global_asin_to_idx[asin] for asin in split_asins],
+            dtype=torch.long,
+            device=device,
+        )
+        gallery_asins = split_asins
+        gallery_cls = gallery_cls.index_select(0, gallery_indices)
+        gallery_embeds = gallery_embeds.index_select(0, gallery_indices)
+        args.gallery_label = f"FashionIQ {args.category}.val"
+    else:
+        gallery_asins = global_gallery_asins
+        args.gallery_label = "Global-74K"
+
+    args.gallery_asins = gallery_asins
+    asin_to_idx = {
+        asin: index for index, asin in enumerate(gallery_asins)
+    }
+    print(
+        f"[INFO] Gallery scope: {args.gallery_label}, "
+        f"{len(gallery_asins):,} ảnh"
+    )
 
     target_idx = None
     if query["target"]:

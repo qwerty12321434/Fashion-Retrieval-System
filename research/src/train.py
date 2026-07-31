@@ -6,7 +6,7 @@ import argparse
 import random
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
 import torch.nn.functional as F
 
 # Ép Windows Terminal dùng UTF-8 để in tiếng Việt
@@ -15,6 +15,46 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 from data.dataset import FashionIQDataset, custom_collate_fn, aacl_collate_fn, CategoryBatchSampler
 from models.model import BaselineFusion, AACLFusion
 from models.loss import CIRLoss, CIRTripletLoss, CIRBatchClassificationLoss
+
+
+def stratified_train_dev_split(dataset, dev_per_category, split_seed):
+    """Tạo dev split cân bằng category và độc lập với training seed."""
+    if dev_per_category <= 0:
+        raise ValueError("dev_per_category phải lớn hơn 0")
+
+    category_indices = {}
+    for index, item in enumerate(dataset.data):
+        category = item.get("category")
+        if category is None:
+            raise ValueError(f"Mẫu index={index} không có trường category")
+        category_indices.setdefault(category, []).append(index)
+
+    rng = random.Random(split_seed)
+    train_indices = []
+    dev_indices = []
+    dev_counts = {}
+
+    for category in sorted(category_indices):
+        indices = category_indices[category].copy()
+        if len(indices) <= dev_per_category:
+            raise ValueError(
+                f"Category {category} chỉ có {len(indices)} mẫu, không đủ "
+                f"để lấy {dev_per_category} dev samples"
+            )
+        rng.shuffle(indices)
+        dev_indices.extend(indices[:dev_per_category])
+        train_indices.extend(indices[dev_per_category:])
+        dev_counts[category] = dev_per_category
+
+    # Tránh để dev loader nhận một dải category cố định theo thứ tự.
+    rng.shuffle(train_indices)
+    rng.shuffle(dev_indices)
+    return (
+        Subset(dataset, train_indices),
+        Subset(dataset, dev_indices),
+        dev_counts,
+    )
+
 
 def eval_accuracy(model, dataloader, device, arch="baseline"):
     """
@@ -70,6 +110,12 @@ def main():
     parser.add_argument("--features_dir", type=str, default="data/features", help="Directory containing feature tensors")
     parser.add_argument("--arch", type=str, default="baseline", choices=["baseline", "aacl"],
                         help="Mô hình: baseline=BaselineFusion (CLS+EOS), aacl=AACLFusion (patches+full text)")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Seed cho model initialization và batch shuffle")
+    parser.add_argument("--split_seed", type=int, default=42,
+                        help="Seed cố định cho train/dev split")
+    parser.add_argument("--dev_per_category", type=int, default=100,
+                        help="Số dev samples lấy từ mỗi category")
     args = parser.parse_args()
 
     print("=== BẮT ĐẦU QUÁ TRÌNH HUẤN LUYỆN (DAY 3) ===")
@@ -85,8 +131,10 @@ def main():
         "lr"          : 1e-4,
         "weight_decay": 1e-4,
         "temperature" : 0.1,
-        "dev_size"    : 300,
-        "seed"        : 42,
+        "dev_size"    : args.dev_per_category * 3,
+        "dev_per_category": args.dev_per_category,
+        "seed"        : args.seed,
+        "split_seed"  : args.split_seed,
         "loss"        : args.loss,
         "features_dir": args.features_dir
     }
@@ -106,6 +154,8 @@ def main():
         
     # Cố định Seed
     torch.manual_seed(config["seed"])
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config["seed"])
     random.seed(config["seed"])
     
     # 2. Chuẩn bị Dữ liệu
@@ -118,10 +168,20 @@ def main():
         use_patches=use_patches
     )
     
-    train_size = len(full_dataset) - config["dev_size"]
-    train_subset, dev_subset = random_split(full_dataset, [train_size, config["dev_size"]])
+    train_subset, dev_subset, dev_counts = stratified_train_dev_split(
+        full_dataset,
+        dev_per_category=config["dev_per_category"],
+        split_seed=config["split_seed"],
+    )
     
     print(f"Tổng mẫu: {len(full_dataset)} | Train: {len(train_subset)} | Dev: {len(dev_subset)}")
+    print(
+        f"Dev split (split_seed={config['split_seed']}): "
+        + ", ".join(
+            f"{category}={count}"
+            for category, count in sorted(dev_counts.items())
+        )
+    )
     
     collate_fn = aacl_collate_fn if use_patches else custom_collate_fn
     
@@ -134,7 +194,10 @@ def main():
     print(f"\n[2/4] Khởi tạo mô hình [{config['arch'].upper()}]...")
     if config["arch"] == "aacl":
         model = AACLFusion(img_dim=768, txt_dim=512, hidden_dim=768).to(device)
-        print("   Kiến trúc: AACLFusion (50 patch tokens + full text sequence)")
+        print(
+            "   Kiến trúc: AACLFusion "
+            "(50 visual tokens = 1 CLS + 49 patches, full text sequence)"
+        )
     else:
         model = BaselineFusion(img_dim=768, txt_dim=512, hidden_dim=1024, out_dim=768).to(device)
         print("   Kiến trúc: BaselineFusion (CLS token + EOS token, MLP)")
@@ -163,6 +226,8 @@ def main():
         # --- TRAIN PHASE ---
         model.train()
         total_loss = 0.0
+        total_query_norm = 0.0
+        train_batch_count = 0
         
         for batch in train_loader:
             if use_patches:
@@ -189,13 +254,19 @@ def main():
                 txt_eos     = txt_feats[torch.arange(B, device=device), eos_indices]
                 combined_query = model(src_imgs, txt_eos)
             loss = criterion(combined_query, tgt_imgs)
-            
+
+            total_query_norm += (
+                combined_query.detach().norm(dim=-1).mean().item()
+            )
+            train_batch_count += 1
+
             loss.backward()
             optimizer.step()
             
             total_loss += loss.item()
-            
+
         avg_train_loss = total_loss / len(train_loader)
+        avg_query_norm = total_query_norm / train_batch_count
         
         # Step LR Scheduler
         scheduler.step()
@@ -203,7 +274,13 @@ def main():
         # --- EVAL PHASE (Dev Subset) ---
         dev_acc = eval_accuracy(model, dev_loader, device, arch=config["arch"])
         
-        print(f"Epoch [{epoch:02d}/{config['epochs']}] | Train Loss: {avg_train_loss:.4f} | Dev Acc@1: {dev_acc:.2f}% | LR: {scheduler.get_last_lr()[0]:.6f}")
+        print(
+            f"Epoch [{epoch:02d}/{config['epochs']}] | "
+            f"Train Loss: {avg_train_loss:.4f} | "
+            f"Mean Query Norm: {avg_query_norm:.4f} | "
+            f"Dev Acc@1: {dev_acc:.2f}% | "
+            f"LR: {scheduler.get_last_lr()[0]:.6f}"
+        )
         
         # --- CHECKPOINTING ---
         # 1. Luôn lưu last

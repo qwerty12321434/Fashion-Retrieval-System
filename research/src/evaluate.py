@@ -1,197 +1,507 @@
-import os
-import sys
+import argparse
 import io
 import json
+import os
+import sys
 import time
-import argparse
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
-from data.dataset import FashionIQDataset, custom_collate_fn
-from models.model import BaselineFusion, AACLFusion
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+from data.dataset import validate_patch_features
+from models.model import AACLFusion, BaselineFusion
 
-def get_rank(sim_matrix, target_score):
-    return (sim_matrix >= target_score).sum().item()
+
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+
+CATEGORIES = ("dress", "shirt", "toptee")
+
+
+def get_rank(similarities, target_idx):
+    """Return the official-style one-based rank using strictly better scores."""
+    target_score = similarities[target_idx]
+    return 1 + int((similarities > target_score).sum().item())
+
+
+def load_json(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def build_gallery_view(
+    gallery_asins,
+    gallery_cls,
+    gallery_embeds,
+    split_asins=None,
+    context="global",
+):
+    """Build a global or split-specific gallery with local ASIN indices."""
+    if split_asins is None:
+        selected_asins = list(gallery_asins)
+        indices = None
+    else:
+        selected_asins = list(split_asins)
+        if len(selected_asins) != len(set(selected_asins)):
+            raise ValueError(f"{context}: split chứa ASIN trùng lặp")
+
+        global_asin_to_idx = {
+            asin: index for index, asin in enumerate(gallery_asins)
+        }
+        missing = [
+            asin for asin in selected_asins if asin not in global_asin_to_idx
+        ]
+        if missing:
+            preview = ", ".join(missing[:10])
+            raise ValueError(
+                f"{context}: thiếu {len(missing)} ảnh split trong gallery. "
+                f"Ví dụ: {preview}"
+            )
+        indices = torch.tensor(
+            [global_asin_to_idx[asin] for asin in selected_asins],
+            dtype=torch.long,
+            device=gallery_cls.device,
+        )
+
+    if indices is None:
+        selected_cls = gallery_cls
+        selected_embeds = gallery_embeds
+    else:
+        selected_cls = gallery_cls.index_select(0, indices)
+        selected_embeds = gallery_embeds.index_select(0, indices)
+
+    return {
+        "asins": selected_asins,
+        "asin_to_idx": {
+            asin: index for index, asin in enumerate(selected_asins)
+        },
+        "cls_norm": F.normalize(selected_cls, p=2, dim=-1),
+        "embeds_norm": F.normalize(selected_embeds, p=2, dim=-1),
+    }
+
+
+def macro_average(category_metrics, metric_name):
+    return sum(
+        category_metrics[category][metric_name] for category in CATEGORIES
+    ) / len(CATEGORIES)
+
+
+def load_model(arch, checkpoint_path, device):
+    state_dict = torch.load(
+        checkpoint_path, map_location=device, weights_only=True
+    )
+    if arch == "aacl":
+        model = AACLFusion(
+            img_dim=768, txt_dim=512, hidden_dim=768
+        ).to(device)
+    else:
+        hidden_dim = state_dict["mlp.0.weight"].shape[0]
+        model = BaselineFusion(hidden_dim=hidden_dim).to(device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model
+
+
+def evaluate_category(
+    category,
+    annotations,
+    text_hidden,
+    text_embeds,
+    gallery_view,
+    gallery_cls,
+    gallery_embeds,
+    global_asin_to_idx,
+    models,
+    arch,
+    candidate_patch_tokens,
+    device,
+):
+    method_names = ["zero_shot"] + list(models)
+    hits = {
+        method_name: {"r10_hits": 0, "r50_hits": 0}
+        for method_name in method_names
+    }
+    valid_queries = 0
+
+    for index, item in enumerate(
+        tqdm(annotations, desc=f"{category}/{len(gallery_view['asins'])}")
+    ):
+        candidate_asin = item["candidate"]
+        target_asin = item["target"]
+
+        if candidate_asin not in global_asin_to_idx:
+            raise ValueError(
+                f"{category}[{index}]: candidate {candidate_asin} "
+                "không có trong global gallery"
+            )
+        if target_asin not in gallery_view["asin_to_idx"]:
+            raise ValueError(
+                f"{category}[{index}]: target {target_asin} "
+                "không có trong gallery của protocol"
+            )
+
+        candidate_global_idx = global_asin_to_idx[candidate_asin]
+        target_local_idx = gallery_view["asin_to_idx"][target_asin]
+        valid_queries += 1
+
+        candidate_embed = F.normalize(
+            gallery_embeds[candidate_global_idx].unsqueeze(0),
+            p=2,
+            dim=-1,
+        )
+        current_text_embed = F.normalize(
+            text_embeds[index].unsqueeze(0), p=2, dim=-1
+        )
+        zero_query = F.normalize(
+            candidate_embed + current_text_embed, p=2, dim=-1
+        )
+        zero_similarities = (
+            zero_query @ gallery_view["embeds_norm"].T
+        ).squeeze(0)
+        zero_rank = get_rank(zero_similarities, target_local_idx)
+        if zero_rank <= 10:
+            hits["zero_shot"]["r10_hits"] += 1
+        if zero_rank <= 50:
+            hits["zero_shot"]["r50_hits"] += 1
+
+        candidate_cls = gallery_cls[candidate_global_idx].unsqueeze(0)
+        current_text_hidden = text_hidden[index].unsqueeze(0)
+
+        for model_name, model in models.items():
+            if arch == "aacl":
+                patches = candidate_patch_tokens[candidate_asin]
+                patches = patches.unsqueeze(0).to(device)
+                text_mask = torch.ones(
+                    1,
+                    current_text_hidden.size(1),
+                    dtype=torch.bool,
+                    device=device,
+                )
+                fusion_query = model(
+                    patches, current_text_hidden, text_mask
+                )
+            else:
+                text_eos = current_text_hidden[:, -1, :]
+                fusion_query = model(candidate_cls, text_eos)
+
+            fusion_query = F.normalize(fusion_query, p=2, dim=-1)
+            similarities = (
+                fusion_query @ gallery_view["cls_norm"].T
+            ).squeeze(0)
+            rank = get_rank(similarities, target_local_idx)
+            if rank <= 10:
+                hits[model_name]["r10_hits"] += 1
+            if rank <= 50:
+                hits[model_name]["r50_hits"] += 1
+
+    if valid_queries == 0:
+        raise ValueError(f"{category}: không có validation query hợp lệ")
+
+    return {
+        method_name: {
+            "queries": valid_queries,
+            "gallery_size": len(gallery_view["asins"]),
+            "r10_hits": values["r10_hits"],
+            "r50_hits": values["r50_hits"],
+            "r10": values["r10_hits"] / valid_queries * 100,
+            "r50": values["r50_hits"] / valid_queries * 100,
+        }
+        for method_name, values in hits.items()
+    }
+
+
+def aggregate_results(results_by_category, method_name):
+    category_metrics = {
+        category: results_by_category[category][method_name]
+        for category in CATEGORIES
+    }
+    total_queries = sum(
+        metrics["queries"] for metrics in category_metrics.values()
+    )
+    total_r10_hits = sum(
+        metrics["r10_hits"] for metrics in category_metrics.values()
+    )
+    total_r50_hits = sum(
+        metrics["r50_hits"] for metrics in category_metrics.values()
+    )
+    return {
+        "categories": category_metrics,
+        "macro_average": {
+            "r10": macro_average(category_metrics, "r10"),
+            "r50": macro_average(category_metrics, "r50"),
+        },
+        "pooled": {
+            "queries": total_queries,
+            "r10": total_r10_hits / total_queries * 100,
+            "r50": total_r50_hits / total_queries * 100,
+        },
+    }
+
+
+def print_method_result(label, result, protocol):
+    print(f"\n{label}")
+    for category in CATEGORIES:
+        metrics = result["categories"][category]
+        print(
+            f" - {category:7s} | gallery={metrics['gallery_size']:5d} "
+            f"| queries={metrics['queries']:4d} "
+            f"| R@10={metrics['r10']:6.2f}% "
+            f"| R@50={metrics['r50']:6.2f}%"
+        )
+
+    macro = result["macro_average"]
+    pooled = result["pooled"]
+    print(
+        f" - Macro average       | R@10={macro['r10']:.2f}% "
+        f"| R@50={macro['r50']:.2f}%"
+    )
+    if protocol == "global":
+        print(
+            f" - Global pooled       | queries={pooled['queries']} "
+            f"| R@10={pooled['r10']:.2f}% "
+            f"| R@50={pooled['r50']:.2f}%"
+        )
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate BaselineFusion model")
-    parser.add_argument("--ckpt", type=str, nargs='+', required=True, help="One or more checkpoints to evaluate (e.g., fashionclip_triplet_1024_best.pth)")
-    parser.add_argument("--features_dir", type=str, default="data/features", help="Thư mục chứa feature .pt files (dùng data/features_fashionclip cho FashionCLIP)")
-    parser.add_argument("--arch", type=str, default="baseline", choices=["baseline", "aacl"],
-                        help="Kiến trúc mô hình: baseline=BaselineFusion, aacl=AACLFusion")
+    parser = argparse.ArgumentParser(
+        description="Evaluate CIR models with FashionIQ or global protocol"
+    )
+    parser.add_argument(
+        "--ckpt",
+        type=str,
+        nargs="+",
+        required=True,
+        help="Một hoặc nhiều checkpoint trong checkpoints/",
+    )
+    parser.add_argument(
+        "--features_dir",
+        type=str,
+        default="data/features",
+        help="Thư mục feature; dùng data/features_fashionclip cho FashionCLIP",
+    )
+    parser.add_argument(
+        "--arch",
+        type=str,
+        default="baseline",
+        choices=["baseline", "aacl"],
+    )
+    parser.add_argument(
+        "--protocol",
+        choices=["fashioniq", "global"],
+        default="fashioniq",
+        help="fashioniq: gallery val theo category; global: toàn bộ catalog local",
+    )
+    parser.add_argument(
+        "--splits_dir",
+        default="data/json",
+        help="Thư mục chứa cap.*.val.json và split.*.val.json",
+    )
+    parser.add_argument(
+        "--output_json",
+        help="Đường dẫn tùy chọn để lưu kết quả JSON có cấu trúc",
+    )
     args = parser.parse_args()
 
-    print("=== ĐÁNH GIÁ MÔ HÌNH (DAY 5) ===")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Sử dụng thiết bị: {device}")
-    print(f"[INFO] Features directory: {os.path.abspath(args.features_dir)}")
-    
-    print(f"\n[INFO] Checkpoints to evaluate: {args.ckpt}")
-    for ckpt_file in args.ckpt:
-        ckpt_path = os.path.abspath(f"checkpoints/{ckpt_file}")
-        mtime = os.path.getmtime(ckpt_path) if os.path.exists(ckpt_path) else 0
-        print(f"  - {ckpt_file} (modified: {time.ctime(mtime)})")
-    
-    features_dir = args.features_dir
-    
-    print("\n1. Đang nạp Gallery (Kho ảnh 74,381)...")
-    gallery_cls_768 = torch.load(
-        os.path.join(features_dir, "gallery_cls_768.pt"),
-        map_location=device,
-        weights_only=True
-    )
-    gallery_embeds_512 = torch.load(
-        os.path.join(features_dir, "gallery_embeds_512.pt"),
-        map_location=device,
-        weights_only=True
-    )
-    with open(os.path.join(features_dir, "gallery_asins.json"), "r") as f:
-        gallery_asins = json.load(f)
-        gallery_asin_to_idx = {asin: idx for idx, asin in enumerate(gallery_asins)}
-        
-    print("\n3. Đang nạp Validation Queries (Tất cả danh mục)...")
-    val_data_all = []
-    val_hidden_all = []
-    val_embeds_all = []
-    
-    for cat in ['dress', 'shirt', 'toptee']:
-        json_path = f"data/json/cap.{cat}.val.json"
-        if not os.path.exists(json_path):
-            continue
-            
-        with open(json_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            val_data_all.extend(data)
-            
-        hidden_dict = torch.load(
-            os.path.join(features_dir, f"{cat}_val_text_hidden.pt"),
-            map_location=device,
-            weights_only=True
+    features_dir = Path(args.features_dir)
+    splits_dir = Path(args.splits_dir)
+
+    print("=== ĐÁNH GIÁ COMPOSED IMAGE RETRIEVAL ===")
+    print(f"Thiết bị : {device}")
+    print(f"Features : {features_dir.resolve()}")
+    print(
+        "Protocol : "
+        + (
+            "FashionIQ Standard (category-specific val gallery)"
+            if args.protocol == "fashioniq"
+            else "Global-74K (toàn bộ catalog local)"
         )
-        embed_dict = torch.load(
-            os.path.join(features_dir, f"{cat}_val_text_embeds.pt"),
-            map_location=device,
-            weights_only=True
+    )
+
+    gallery_cls = torch.load(
+        features_dir / "gallery_cls_768.pt",
+        map_location=device,
+        weights_only=True,
+    )
+    gallery_embeds = torch.load(
+        features_dir / "gallery_embeds_512.pt",
+        map_location=device,
+        weights_only=True,
+    )
+    gallery_asins = load_json(features_dir / "gallery_asins.json")
+    if len(gallery_asins) != gallery_cls.shape[0]:
+        raise ValueError("gallery_asins và gallery_cls không cùng số phần tử")
+    if len(gallery_asins) != gallery_embeds.shape[0]:
+        raise ValueError("gallery_asins và gallery_embeds không cùng số phần tử")
+    global_asin_to_idx = {
+        asin: index for index, asin in enumerate(gallery_asins)
+    }
+    print(f"Global gallery: {len(gallery_asins):,} ảnh")
+
+    category_data = {}
+    all_candidates = []
+    for category in CATEGORIES:
+        annotations = load_json(
+            splits_dir / f"cap.{category}.val.json"
         )
-        
-        # Flatten dict into list based on indices
-        val_hidden_all.extend([hidden_dict[i] for i in range(len(hidden_dict))])
-        val_embeds_all.extend([embed_dict[i] for i in range(len(embed_dict))])
-    
-    # Initialize counts
-    recall_10_zs = recall_50_zs = 0
-    
-    # Load multiple models
-    models = []
-    model_names = []
-    recalls_10 = []
-    recalls_50 = []
-    
-    # Load candidate patch tokens nếu cần (AACL mode)
+        text_hidden = torch.load(
+            features_dir / f"{category}_val_text_hidden.pt",
+            map_location=device,
+            weights_only=True,
+        )
+        text_embeds = torch.load(
+            features_dir / f"{category}_val_text_embeds.pt",
+            map_location=device,
+            weights_only=True,
+        )
+        if len(annotations) != len(text_hidden):
+            raise ValueError(
+                f"{category}: annotation ({len(annotations)}) và "
+                f"text hidden ({len(text_hidden)}) không khớp"
+            )
+        if len(annotations) != len(text_embeds):
+            raise ValueError(
+                f"{category}: annotation ({len(annotations)}) và "
+                f"text embeds ({len(text_embeds)}) không khớp"
+            )
+
+        if args.protocol == "fashioniq":
+            split_path = splits_dir / f"split.{category}.val.json"
+            if not split_path.exists():
+                raise FileNotFoundError(
+                    f"Thiếu FashionIQ split chính thức: {split_path}"
+                )
+            split_asins = load_json(split_path)
+        else:
+            split_asins = None
+
+        gallery_view = build_gallery_view(
+            gallery_asins,
+            gallery_cls,
+            gallery_embeds,
+            split_asins=split_asins,
+            context=f"{category}.val",
+        )
+        category_data[category] = {
+            "annotations": annotations,
+            "text_hidden": text_hidden,
+            "text_embeds": text_embeds,
+            "gallery_view": gallery_view,
+        }
+        all_candidates.extend(
+            item["candidate"] for item in annotations
+        )
+        print(
+            f"{category:7s}: queries={len(annotations):,}, "
+            f"gallery={len(gallery_view['asins']):,}"
+        )
+
     candidate_patch_tokens = None
     if args.arch == "aacl":
-        patch_path = os.path.join(features_dir, "candidate_patch_tokens.pt")
-        if not os.path.exists(patch_path):
-            print(f"[LỖI] Không tìm thấy {patch_path}.")
-            print("  Chạy trước: python scripts/prep_candidate_patches.py")
-            return
-        print(f"  Nạp candidate patch tokens từ {patch_path}...")
+        patch_path = features_dir / "candidate_patch_tokens.pt"
+        if not patch_path.exists():
+            raise FileNotFoundError(
+                f"Không tìm thấy {patch_path}. "
+                "Chạy scripts/prep_candidate_patches.py trước."
+            )
+        print(f"Nạp candidate patch tokens: {patch_path}")
         candidate_patch_tokens = torch.load(
-            patch_path, map_location="cpu", weights_only=True, mmap=True
+            patch_path,
+            map_location="cpu",
+            weights_only=True,
+            mmap=True,
         )
-        print(f"  Đã nạp {len(candidate_patch_tokens)} ASIN patch tokens.")
+        validate_patch_features(
+            candidate_patch_tokens,
+            all_candidates,
+            expected_shape=(50, gallery_cls.shape[-1]),
+            context="validation",
+        )
 
-    for ckpt_file in args.ckpt:
-        print(f"   Khởi tạo mô hình [{args.arch.upper()}] từ {ckpt_file}...")
-        state_dict = torch.load(f"checkpoints/{ckpt_file}", map_location=device, weights_only=True)
-        
-        if args.arch == "aacl":
-            model = AACLFusion(img_dim=768, txt_dim=512, hidden_dim=768).to(device)
-        else:
-            model = BaselineFusion(hidden_dim=1024).to(device)
-        model.load_state_dict(state_dict)
-        model.eval()
-        models.append(model)
-        
-        # Derive run name from checkpoint filename
-        run_name = ckpt_file.replace("_best.pth", "").replace("_last.pth", "").replace(".pth", "")
-        model_names.append(run_name)
-        recalls_10.append(0)
-        recalls_50.append(0)
-    
-    print(f"\n5. BẮT ĐẦU ĐÁNH GIÁ (Cross-modal Retrieval) trên {len(val_data_all)} queries...")
-    
-    valid_queries = 0
-    
-    gallery_embeds_512_norm = F.normalize(gallery_embeds_512, p=2, dim=-1)
-    gallery_cls_norm = F.normalize(gallery_cls_768, p=2, dim=-1)
-    
+    models = {}
+    checkpoint_metadata = {}
+    for checkpoint_name in args.ckpt:
+        checkpoint_path = Path("checkpoints") / checkpoint_name
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Thiếu checkpoint: {checkpoint_path}")
+        run_name = (
+            checkpoint_name.replace("_best.pth", "")
+            .replace("_last.pth", "")
+            .replace(".pth", "")
+        )
+        print(
+            f"Nạp checkpoint: {checkpoint_name} "
+            f"(modified: {time.ctime(os.path.getmtime(checkpoint_path))})"
+        )
+        models[run_name] = load_model(
+            args.arch, checkpoint_path, device
+        )
+        checkpoint_metadata[run_name] = checkpoint_name
+
+    results_by_category = {}
     with torch.no_grad():
-        for i, item in enumerate(tqdm(val_data_all)):
-            candidate_asin = item['candidate']
-            target_asin = item['target']
-            
-            if candidate_asin not in gallery_asin_to_idx or target_asin not in gallery_asin_to_idx:
-                continue
-                
-            candidate_idx = gallery_asin_to_idx[candidate_asin]
-            target_idx = gallery_asin_to_idx[target_asin]
-            valid_queries += 1
-            
-            # --- ĐỐI THỦ 1: CLIP ZERO-SHOT ---
-            c_embed = F.normalize(gallery_embeds_512[candidate_idx].unsqueeze(0), p=2, dim=-1)
-            t_embed = F.normalize(val_embeds_all[i].unsqueeze(0), p=2, dim=-1)
-            zs_query = F.normalize(c_embed + t_embed, p=2, dim=-1)
-            
-            zs_sims = (zs_query @ gallery_embeds_512_norm.T).squeeze(0)
-            zs_target_score = zs_sims[target_idx].item()
-            zs_rank = get_rank(zs_sims, zs_target_score)
-            if zs_rank <= 10: recall_10_zs += 1
-            if zs_rank <= 50: recall_50_zs += 1
-            
-            # --- ĐỐI THỦ 2+: FUSION MODEL (tất cả checkpoints) ---
-            c_cls    = gallery_cls_768[candidate_idx].unsqueeze(0)  # [1, 768]
-            t_hidden = val_hidden_all[i].unsqueeze(0)               # [1, seq_len, 512]
-            
-            for m_idx, model in enumerate(models):
-                if args.arch == "aacl" and candidate_patch_tokens is not None:
-                    # AACL: dùng patch tokens + full text sequence
-                    patches = candidate_patch_tokens.get(
-                        candidate_asin, torch.zeros(50, 768)
-                    ).unsqueeze(0).to(device)   # [1, 50, 768]
-                    # tạo mask (toàn bộ real vì val text không có padding trong trường hợp 1 mẫu)
-                    t_mask = torch.ones(1, t_hidden.size(1), device=device, dtype=torch.bool)
-                    fusion_query = model(patches, t_hidden, t_mask)
-                else:
-                    # Baseline: CLS + EOS
-                    t_eos        = t_hidden[:, -1, :]               # [1, 512]
-                    fusion_query = model(c_cls, t_eos)
-                
-                bf_query_norm  = F.normalize(fusion_query, p=2, dim=-1)
-                bf_sims        = (bf_query_norm @ gallery_cls_norm.T).squeeze(0)
-                bf_target_score= bf_sims[target_idx].item()
-                bf_rank        = get_rank(bf_sims, bf_target_score)
-                if bf_rank <= 10: recalls_10[m_idx] += 1
-                if bf_rank <= 50: recalls_50[m_idx] += 1
-            
-    print("\n=== KẾT QUẢ TỔNG HỢP ===")
-    print(f"Tổng số truy vấn hợp lệ: {valid_queries}/{len(val_data_all)}")
-    
-    if valid_queries == 0:
-        print("\n[CẢNH BÁO] Không có truy vấn hợp lệ nào! Kiểm tra lại --features_dir và gallery_asins.json")
-        return
-        
-    print("\n1. CLIP ZERO-SHOT (Vector Addition)")
-    print(f" - Recall@10: {recall_10_zs / valid_queries * 100:.2f}%")
-    print(f" - Recall@50: {recall_50_zs / valid_queries * 100:.2f}%")
-    
-    for m_idx, name in enumerate(model_names):
-        label = "AACL FUSION" if args.arch == "aacl" else "BASELINE FUSION"
-        print(f"\n{m_idx + 2}. {label} ({name})")
-        print(f" - Recall@10: {recalls_10[m_idx] / valid_queries * 100:.2f}%")
-        print(f" - Recall@50: {recalls_50[m_idx] / valid_queries * 100:.2f}%")
+        for category in CATEGORIES:
+            inputs = category_data[category]
+            results_by_category[category] = evaluate_category(
+                category=category,
+                annotations=inputs["annotations"],
+                text_hidden=inputs["text_hidden"],
+                text_embeds=inputs["text_embeds"],
+                gallery_view=inputs["gallery_view"],
+                gallery_cls=gallery_cls,
+                gallery_embeds=gallery_embeds,
+                global_asin_to_idx=global_asin_to_idx,
+                models=models,
+                arch=args.arch,
+                candidate_patch_tokens=candidate_patch_tokens,
+                device=device,
+            )
+
+    output = {
+        "protocol": args.protocol,
+        "protocol_label": (
+            "FashionIQ Standard"
+            if args.protocol == "fashioniq"
+            else "Global-74K"
+        ),
+        "architecture": args.arch,
+        "features_dir": str(features_dir),
+        "global_gallery_size": len(gallery_asins),
+        "methods": {},
+    }
+
+    print("\n=== KẾT QUẢ ===")
+    zero_result = aggregate_results(
+        results_by_category, "zero_shot"
+    )
+    output["methods"]["zero_shot"] = {
+        "checkpoint": None,
+        **zero_result,
+    }
+    print_method_result("ZERO-SHOT VECTOR ADDITION", zero_result, args.protocol)
+
+    for run_name in models:
+        result = aggregate_results(results_by_category, run_name)
+        output["methods"][run_name] = {
+            "checkpoint": checkpoint_metadata[run_name],
+            **result,
+        }
+        label = (
+            "AACL FUSION" if args.arch == "aacl" else "BASELINE FUSION"
+        )
+        print_method_result(
+            f"{label} ({run_name})", result, args.protocol
+        )
+
+    if args.output_json:
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as handle:
+            json.dump(output, handle, ensure_ascii=False, indent=2)
+        print(f"\nĐã lưu kết quả: {output_path.resolve()}")
+
 
 if __name__ == "__main__":
     main()
